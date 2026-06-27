@@ -391,10 +391,9 @@ YTDL_OPTS = {
     'no_warnings': True,
     'default_search': 'ytsearch',
     'source_address': '0.0.0.0',
-    'extractor_args': {'youtube': {'player_client': ['web_creator', 'tv_embedded']}},
-    'cookiefile': '/app/cookies.txt',
+    'extractor_args': {'youtube': {'player_client': ['ios', 'web']}},
     'http_headers': {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)',
     },
 }
 FFMPEG_OPTS = {
@@ -413,7 +412,17 @@ def get_queue(guild_id):
 async def search_yt(query: str):
     loop = asyncio.get_event_loop()
     def _search():
-        with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
+        # Ghi cookies từ biến môi trường ra file tạm nếu có
+        import tempfile, os
+        cookies_content = os.environ.get("YOUTUBE_COOKIES", "")
+        opts = dict(YTDL_OPTS)
+        if cookies_content:
+            tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+            tmp.write(cookies_content)
+            tmp.close()
+            opts['cookiefile'] = tmp.name
+            log.info(f"🍪 Dùng cookies từ env var")
+        with yt_dlp.YoutubeDL(opts) as ydl:
             try:
                 info = ydl.extract_info(query, download=False)
                 if 'entries' in info: info = info['entries'][0]
@@ -422,6 +431,10 @@ async def search_yt(query: str):
                         'thumbnail': info.get('thumbnail',''), 'uploader': info.get('uploader','')}
             except Exception as e:
                 log.error(f"yt-dlp: {e}"); return None
+            finally:
+                if cookies_content:
+                    try: os.unlink(opts['cookiefile'])
+                    except: pass
     return await loop.run_in_executor(None, _search)
 
 def fmt_dur(sec):
