@@ -39,7 +39,7 @@ intents.message_content = True
 # ── Bot ───────────────────────────────────────────────────────────────────────
 class VoiceBot(commands.Bot):
     def __init__(self):
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(command_prefix="+", intents=intents)
         self.permanent_channel_id: int = TARGET_CHANNEL
         self.temp_channel_id: int      = 0
         self.auto_rejoin: bool         = True
@@ -235,6 +235,42 @@ def is_admin():
         return interaction.user.guild_permissions.manage_guild or \
                interaction.user.guild_permissions.administrator
     return app_commands.check(predicate)
+
+
+# ── Prefix commands ────────────────────────────────────────────────────────────
+@bot.command(name="ping")
+async def ping(ctx: commands.Context):
+    ms = round(bot.latency * 1000)
+    uptime = datetime.now(timezone.utc) - bot.start_time
+    h, rem = divmod(int(uptime.total_seconds()), 3600); m, s = divmod(rem, 60)
+    voice_ch = ""
+    if bot.voice_clients:
+        vc = bot.voice_clients[0]
+        voice_ch = f"🎙️ **#{vc.channel.name}** ({vc.guild.name})"
+    else:
+        voice_ch = "❌ Chưa vào kênh nào"
+    embed = discord.Embed(title="🏓 Pong!", color=0x5865f2)
+    embed.add_field(name="📶 Độ trễ",  value=f"`{ms}ms`",          inline=True)
+    embed.add_field(name="⏱️ Uptime",  value=f"`{h}h {m}m {s}s`", inline=True)
+    embed.add_field(name="🎙️ Voice",   value=voice_ch,             inline=False)
+    embed.set_footer(text=f"Bot: {bot.user}", icon_url=bot.user.display_avatar.url)
+    await ctx.reply(embed=embed)
+
+@bot.command(name="help", aliases=["h"])
+async def help_cmd(ctx: commands.Context):
+    embed = discord.Embed(title="📖 Danh sách lệnh", color=0x5865f2)
+    embed.add_field(name="🔧 Lệnh thường",
+        value="`+ping` — Kiểm tra bot còn sống không\n`+help` — Xem danh sách lệnh",
+        inline=False)
+    embed.add_field(name="👤 Profile *(Slash commands)*",
+        value="`/profile @user` — Xem profile thành viên\n"
+              "`/profile_set @user` — Tạo/sửa profile *(Admin)*\n"
+              "`/profile_addphoto @user url` — Thêm ảnh *(Admin)*\n"
+              "`/profile_removephoto @user số` — Xóa ảnh *(Admin)*\n"
+              "`/profile_delete @user` — Xóa profile *(Admin)*",
+        inline=False)
+    embed.set_footer(text=f"Prefix: + | Bot: {bot.user}")
+    await ctx.reply(embed=embed)
 
 
 @bot.tree.command(name="profile", description="Xem profile của một thành viên")
