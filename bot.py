@@ -391,10 +391,7 @@ YTDL_OPTS = {
     'no_warnings': False,
     'default_search': 'ytsearch',
     'source_address': '0.0.0.0',
-    'extractor_args': {'youtube': {'player_client': ['android']}},
-    'http_headers': {
-        'User-Agent': 'com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip',
-    },
+    'extractor_args': {'youtube': {'player_client': ['web']}},
 }
 FFMPEG_OPTS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
