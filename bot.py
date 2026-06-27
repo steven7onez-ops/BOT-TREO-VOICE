@@ -39,7 +39,7 @@ intents.message_content = True
 # ── Bot ───────────────────────────────────────────────────────────────────────
 class VoiceBot(commands.Bot):
     def __init__(self):
-        super().__init__(command_prefix="+", intents=intents)
+        super().__init__(command_prefix="+", intents=intents, help_command=None)
         self.permanent_channel_id: int = TARGET_CHANNEL
         self.temp_channel_id: int      = 0
         self.auto_rejoin: bool         = True
