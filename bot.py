@@ -379,6 +379,164 @@ async def admin_error(ctx: commands.Context, error):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  MUSIC SYSTEM
+# ══════════════════════════════════════════════════════════════════════════════
+import yt_dlp
+from collections import deque
+
+YTDL_OPTS = {
+    'format': 'bestaudio/best',
+    'noplaylist': True,
+    'quiet': True,
+    'no_warnings': True,
+    'default_search': 'ytsearch',
+    'source_address': '0.0.0.0',
+}
+FFMPEG_OPTS = {
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    'options': '-vn',
+}
+
+music_queues: dict = {}
+now_playing:  dict = {}
+
+def get_queue(guild_id):
+    if guild_id not in music_queues:
+        music_queues[guild_id] = deque()
+    return music_queues[guild_id]
+
+async def search_yt(query: str):
+    loop = asyncio.get_event_loop()
+    def _search():
+        with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
+            try:
+                info = ydl.extract_info(query, download=False)
+                if 'entries' in info: info = info['entries'][0]
+                return {'url': info['url'], 'title': info.get('title','Không rõ'),
+                        'duration': info.get('duration',0), 'webpage': info.get('webpage_url',''),
+                        'thumbnail': info.get('thumbnail',''), 'uploader': info.get('uploader','')}
+            except Exception as e:
+                log.error(f"yt-dlp: {e}"); return None
+    return await loop.run_in_executor(None, _search)
+
+def fmt_dur(sec):
+    if not sec: return '?:??'
+    m, s = divmod(sec, 60); h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+def play_next(guild_id, vc):
+    q = get_queue(guild_id)
+    if not q: now_playing.pop(guild_id, None); return
+    track = q.popleft()
+    now_playing[guild_id] = track
+    src = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(track['url'], **FFMPEG_OPTS), volume=0.7)
+    def after(err):
+        if err: log.error(f"Player: {err}")
+        asyncio.run_coroutine_threadsafe(_play_after(guild_id), bot.loop)
+    vc.play(src, after=after)
+
+async def _play_after(guild_id):
+    guild = bot.get_guild(guild_id)
+    if not guild: return
+    vc = guild.voice_client
+    if vc and not vc.is_playing(): play_next(guild_id, vc)
+
+@bot.command(name="play", aliases=["ph"])
+async def play_cmd(ctx: commands.Context, *, query: str = ""):
+    if not query: await ctx.reply("❌ Cú pháp: `+play [tên bài/link YouTube]`"); return
+    if not ctx.author.voice: await ctx.reply("❌ Bạn cần vào kênh voice trước!"); return
+    vc = ctx.guild.voice_client
+    if not vc: vc = await ctx.author.voice.channel.connect()
+    elif vc.channel != ctx.author.voice.channel: await vc.move_to(ctx.author.voice.channel)
+    msg = await ctx.reply("🔍 Đang tìm kiếm...")
+    track = await search_yt(query)
+    if not track: await msg.edit(content="❌ Không tìm thấy bài hát!"); return
+    track['requester'] = ctx.author.display_name
+    q = get_queue(ctx.guild.id)
+    if vc.is_playing() or vc.is_paused():
+        q.append(track)
+        embed = discord.Embed(title="➕ Thêm vào hàng đợi", description=f"[{track['title']}]({track['webpage']})", color=0x5865f2)
+        embed.add_field(name="⏱️", value=fmt_dur(track['duration']), inline=True)
+        embed.add_field(name="📋 Vị trí", value=f"#{len(q)}", inline=True)
+        embed.add_field(name="👤", value=track['requester'], inline=True)
+        if track['thumbnail']: embed.set_thumbnail(url=track['thumbnail'])
+        await msg.edit(content=None, embed=embed)
+    else:
+        q.appendleft(track)
+        play_next(ctx.guild.id, vc)
+        embed = discord.Embed(title="▶️ Đang phát", description=f"[{track['title']}]({track['webpage']})", color=0x3ba55d)
+        embed.add_field(name="⏱️", value=fmt_dur(track['duration']), inline=True)
+        embed.add_field(name="👤", value=track['requester'], inline=True)
+        if track['thumbnail']: embed.set_thumbnail(url=track['thumbnail'])
+        await msg.edit(content=None, embed=embed)
+
+@bot.command(name="skip", aliases=["s", "next"])
+async def skip_cmd(ctx: commands.Context):
+    vc = ctx.guild.voice_client
+    if not vc or not vc.is_playing(): await ctx.reply("❌ Không có bài nào đang phát!"); return
+    vc.stop(); await ctx.reply("⏭️ Đã bỏ qua!")
+
+@bot.command(name="queue", aliases=["q", "ds"])
+async def queue_cmd(ctx: commands.Context):
+    q = get_queue(ctx.guild.id); current = now_playing.get(ctx.guild.id)
+    if not current and not q: await ctx.reply("📋 Hàng đợi trống!"); return
+    embed = discord.Embed(title="📋 Hàng đợi nhạc", color=0x5865f2)
+    if current:
+        embed.add_field(name="▶️ Đang phát", value=f"[{current['title']}]({current['webpage']}) `{fmt_dur(current['duration'])}` — {current.get('requester','')}", inline=False)
+    if q:
+        lines = [f"`{i}.` [{t['title']}]({t['webpage']}) `{fmt_dur(t['duration'])}` — {t.get('requester','')}" for i,t in enumerate(list(q)[:10],1)]
+        if len(q)>10: lines.append(f"*... và {len(q)-10} bài nữa*")
+        embed.add_field(name=f"⏳ Hàng đợi ({len(q)} bài)", value="\n".join(lines), inline=False)
+    await ctx.reply(embed=embed)
+
+@bot.command(name="pause")
+async def pause_cmd(ctx: commands.Context):
+    vc = ctx.guild.voice_client
+    if vc and vc.is_playing(): vc.pause(); await ctx.reply("⏸️ Đã tạm dừng!")
+    else: await ctx.reply("❌ Không có bài nào đang phát!")
+
+@bot.command(name="resume", aliases=["tieptuc"])
+async def resume_cmd(ctx: commands.Context):
+    vc = ctx.guild.voice_client
+    if vc and vc.is_paused(): vc.resume(); await ctx.reply("▶️ Tiếp tục phát!")
+    else: await ctx.reply("❌ Nhạc không bị tạm dừng!")
+
+@bot.command(name="stop", aliases=["dung"])
+async def stop_cmd(ctx: commands.Context):
+    q = get_queue(ctx.guild.id); q.clear(); now_playing.pop(ctx.guild.id, None)
+    vc = ctx.guild.voice_client
+    if vc: vc.stop()
+    await ctx.reply("⏹️ Đã dừng nhạc và xóa hàng đợi!")
+
+@bot.command(name="nowplaying", aliases=["np", "dangphat"])
+async def np_cmd(ctx: commands.Context):
+    current = now_playing.get(ctx.guild.id)
+    if not current: await ctx.reply("❌ Không có bài nào đang phát!"); return
+    embed = discord.Embed(title="▶️ Đang phát", description=f"[{current['title']}]({current['webpage']})", color=0x3ba55d)
+    embed.add_field(name="⏱️", value=fmt_dur(current['duration']), inline=True)
+    embed.add_field(name="👤", value=current.get('requester','?'), inline=True)
+    if current['thumbnail']: embed.set_thumbnail(url=current['thumbnail'])
+    await ctx.reply(embed=embed)
+
+@bot.command(name="volume", aliases=["vol", "am"])
+async def volume_cmd(ctx: commands.Context, vol: int = None):
+    vc = ctx.guild.voice_client
+    if not vc or not vc.source: await ctx.reply("❌ Không có bài nào đang phát!"); return
+    if vol is None: await ctx.reply(f"🔊 Âm lượng: **{int(vc.source.volume*100)}%**"); return
+    if not 0 <= vol <= 150: await ctx.reply("❌ Âm lượng từ 0-150!"); return
+    vc.source.volume = vol/100; await ctx.reply(f"🔊 Âm lượng: **{vol}%**")
+
+@bot.command(name="remove", aliases=["xoa2"])
+async def remove_cmd(ctx: commands.Context, vi_tri: int = None):
+    if not vi_tri: await ctx.reply("❌ Cú pháp: `+remove [số thứ tự]`"); return
+    q = get_queue(ctx.guild.id)
+    if vi_tri < 1 or vi_tri > len(q): await ctx.reply("❌ Số thứ tự không hợp lệ!"); return
+    lst = list(q); removed = lst.pop(vi_tri-1)
+    music_queues[ctx.guild.id] = deque(lst)
+    await ctx.reply(f"🗑️ Đã xóa: **{removed['title']}**")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  DASHBOARD HTML
 # ══════════════════════════════════════════════════════════════════════════════
 DASHBOARD_HTML = r"""<!DOCTYPE html>
