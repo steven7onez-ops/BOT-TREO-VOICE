@@ -259,118 +259,113 @@ async def ping(ctx: commands.Context):
 @bot.command(name="help", aliases=["h"])
 async def help_cmd(ctx: commands.Context):
     embed = discord.Embed(title="📖 Danh sách lệnh", color=0x5865f2)
-    embed.add_field(name="🔧 Lệnh thường",
+    embed.add_field(name="🔧 Lệnh chung",
         value="`+ping` — Kiểm tra bot còn sống không\n`+help` — Xem danh sách lệnh",
         inline=False)
-    embed.add_field(name="👤 Profile *(Slash commands)*",
-        value="`/profile @user` — Xem profile thành viên\n"
-              "`/profile_set @user` — Tạo/sửa profile *(Admin)*\n"
-              "`/profile_addphoto @user url` — Thêm ảnh *(Admin)*\n"
-              "`/profile_removephoto @user số` — Xóa ảnh *(Admin)*\n"
-              "`/profile_delete @user` — Xóa profile *(Admin)*",
+    embed.add_field(name="👤 Profile",
+        value="`+profile @user` (`+p`) — Xem profile thành viên\n"
+              "`+profile_set @user ten:Tên tags:Tag1 | Tag2` (`+pset`) — Tạo/sửa *(Admin)*\n"
+              "`+profile_addphoto @user https://url` (`+padd`) — Thêm ảnh *(Admin)*\n"
+              "`+profile_removephoto @user 1` (`+pdel`) — Xóa ảnh *(Admin)*\n"
+              "`+profile_delete @user` (`+pdelete`) — Xóa profile *(Admin)*",
         inline=False)
     embed.set_footer(text=f"Prefix: + | Bot: {bot.user}")
     await ctx.reply(embed=embed)
 
 
-@bot.tree.command(name="profile", description="Xem profile của một thành viên")
-@app_commands.describe(thanh_vien="Tag thành viên muốn xem")
-async def profile_cmd(interaction: discord.Interaction, thanh_vien: discord.Member):
+# ── Profile prefix commands ────────────────────────────────────────────────────
+@bot.command(name="profile", aliases=["p"])
+async def profile_cmd(ctx: commands.Context, thanh_vien: discord.Member = None):
+    if not thanh_vien:
+        await ctx.reply("❌ Cú pháp: `+profile @user`"); return
     uid = str(thanh_vien.id)
     db  = load_db()
     if uid not in db:
-        await interaction.response.send_message(f"❌ **{thanh_vien.display_name}** chưa có profile.", ephemeral=True); return
+        await ctx.reply(f"❌ **{thanh_vien.display_name}** chưa có profile."); return
     view = ProfileView(uid, thanh_vien)
     embed = build_embed(db[uid], thanh_vien, 0)
-    await interaction.response.send_message(embed=embed, view=view)
+    await ctx.reply(embed=embed, view=view)
 
 
-@bot.tree.command(name="profile_set", description="[Admin] Tạo/sửa thông tin profile")
-@app_commands.describe(
-    thanh_vien="Thành viên cần tạo/sửa profile",
-    ten_hien_thi="Tên hiển thị trên card",
-    tags="Các tag mô tả, cách nhau bằng dấu | (vd: Hà Nội | Thích game | Dễ tính)"
-)
-@is_admin()
-async def profile_set(interaction: discord.Interaction,
-                      thanh_vien: discord.Member,
-                      ten_hien_thi: str = "",
-                      tags: str = ""):
+@bot.command(name="profile_set", aliases=["pset"])
+@commands.has_permissions(manage_guild=True)
+async def profile_set(ctx: commands.Context, thanh_vien: discord.Member = None, *, args: str = ""):
+    if not thanh_vien:
+        await ctx.reply("❌ Cú pháp: `+profile_set @user ten:Tên | tags:Tag1 | Tag2`"); return
     uid = str(thanh_vien.id)
     db  = load_db()
     p   = db.setdefault(uid, {})
-    if ten_hien_thi: p["display_name"] = ten_hien_thi.strip()
-    if tags:
-        p["tags"] = [t.strip() for t in tags.split("|") if t.strip()]
+    # Parse: ten:Tên tags:Tag1 | Tag2 | Tag3
+    ten = ""; tags_raw = ""
+    if "tags:" in args:
+        parts = args.split("tags:", 1)
+        ten_part = parts[0].strip()
+        tags_raw = parts[1].strip()
+        if "ten:" in ten_part:
+            ten = ten_part.replace("ten:", "").strip()
+    elif "ten:" in args:
+        ten = args.replace("ten:", "").strip()
+    if ten: p["display_name"] = ten
+    if tags_raw:
+        p["tags"] = [t.strip() for t in tags_raw.split("|") if t.strip()]
     save_db(db)
-    await interaction.response.send_message(
-        f"✅ Đã cập nhật profile của **{thanh_vien.display_name}**!", ephemeral=True)
+    await ctx.reply(f"✅ Đã cập nhật profile của **{thanh_vien.display_name}**!")
 
 
-@bot.tree.command(name="profile_addphoto", description="[Admin] Thêm ảnh vào gallery của thành viên")
-@app_commands.describe(
-    thanh_vien="Thành viên cần thêm ảnh",
-    url_anh="URL ảnh (link trực tiếp đến file ảnh)"
-)
-@is_admin()
-async def profile_addphoto(interaction: discord.Interaction,
-                           thanh_vien: discord.Member,
-                           url_anh: str):
+@bot.command(name="profile_addphoto", aliases=["pphoto", "padd"])
+@commands.has_permissions(manage_guild=True)
+async def profile_addphoto(ctx: commands.Context, thanh_vien: discord.Member = None, *, url_anh: str = ""):
+    if not thanh_vien or not url_anh:
+        await ctx.reply("❌ Cú pháp: `+profile_addphoto @user https://link-anh.jpg`"); return
     if not url_anh.startswith("http"):
-        await interaction.response.send_message("❌ URL không hợp lệ!", ephemeral=True); return
+        await ctx.reply("❌ URL không hợp lệ!"); return
     uid = str(thanh_vien.id)
     db  = load_db()
     p   = db.setdefault(uid, {})
     p.setdefault("photos", []).append(url_anh)
     save_db(db)
     total = len(p["photos"])
-    await interaction.response.send_message(
-        f"✅ Đã thêm ảnh #{total} cho **{thanh_vien.display_name}**!", ephemeral=True)
+    await ctx.reply(f"✅ Đã thêm ảnh #{total} cho **{thanh_vien.display_name}**!")
 
 
-@bot.tree.command(name="profile_removephoto", description="[Admin] Xóa ảnh khỏi gallery")
-@app_commands.describe(
-    thanh_vien="Thành viên cần xóa ảnh",
-    so_thu_tu="Số thứ tự ảnh muốn xóa (1, 2, 3...)"
-)
-@is_admin()
-async def profile_removephoto(interaction: discord.Interaction,
-                               thanh_vien: discord.Member,
-                               so_thu_tu: int):
+@bot.command(name="profile_removephoto", aliases=["premove", "pdel"])
+@commands.has_permissions(manage_guild=True)
+async def profile_removephoto(ctx: commands.Context, thanh_vien: discord.Member = None, so_thu_tu: int = 0):
+    if not thanh_vien or not so_thu_tu:
+        await ctx.reply("❌ Cú pháp: `+profile_removephoto @user 1`"); return
     uid = str(thanh_vien.id)
     db  = load_db()
     p   = db.get(uid, {})
     photos = p.get("photos", [])
     if not photos or so_thu_tu < 1 or so_thu_tu > len(photos):
-        await interaction.response.send_message("❌ Số thứ tự không hợp lệ!", ephemeral=True); return
-    removed = photos.pop(so_thu_tu - 1)
+        await ctx.reply("❌ Số thứ tự không hợp lệ!"); return
+    photos.pop(so_thu_tu - 1)
     save_db(db)
-    await interaction.response.send_message(
-        f"✅ Đã xóa ảnh #{so_thu_tu} của **{thanh_vien.display_name}**!", ephemeral=True)
+    await ctx.reply(f"✅ Đã xóa ảnh #{so_thu_tu} của **{thanh_vien.display_name}**!")
 
 
-@bot.tree.command(name="profile_delete", description="[Admin] Xóa toàn bộ profile của thành viên")
-@app_commands.describe(thanh_vien="Thành viên cần xóa profile")
-@is_admin()
-async def profile_delete(interaction: discord.Interaction, thanh_vien: discord.Member):
+@bot.command(name="profile_delete", aliases=["pdelete"])
+@commands.has_permissions(manage_guild=True)
+async def profile_delete(ctx: commands.Context, thanh_vien: discord.Member = None):
+    if not thanh_vien:
+        await ctx.reply("❌ Cú pháp: `+profile_delete @user`"); return
     uid = str(thanh_vien.id)
     db  = load_db()
     if uid not in db:
-        await interaction.response.send_message("❌ Thành viên này chưa có profile.", ephemeral=True); return
+        await ctx.reply("❌ Thành viên này chưa có profile."); return
     del db[uid]
     save_db(db)
-    await interaction.response.send_message(
-        f"✅ Đã xóa profile của **{thanh_vien.display_name}**!", ephemeral=True)
+    await ctx.reply(f"✅ Đã xóa profile của **{thanh_vien.display_name}**!")
 
 
-# Error handler
+# Error handler cho prefix commands
 @profile_set.error
 @profile_addphoto.error
 @profile_removephoto.error
 @profile_delete.error
-async def admin_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.CheckFailure):
-        await interaction.response.send_message("❌ Bạn cần quyền **Quản lý server** để dùng lệnh này!", ephemeral=True)
+async def admin_error(ctx: commands.Context, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.reply("❌ Bạn cần quyền **Quản lý server** để dùng lệnh này!")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
