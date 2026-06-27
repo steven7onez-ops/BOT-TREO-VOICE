@@ -385,16 +385,13 @@ import yt_dlp
 from collections import deque
 
 YTDL_OPTS = {
-    'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
+    'format': '(bestaudio[acodec=opus]/bestaudio[acodec=aac]/bestaudio)/best',
     'noplaylist': True,
     'quiet': True,
     'no_warnings': True,
     'default_search': 'ytsearch',
     'source_address': '0.0.0.0',
-    'extractor_args': {'youtube': {'player_client': ['ios']}},
-    'http_headers': {
-        'User-Agent': 'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)',
-    },
+    'extractor_args': {'youtube': {'player_client': ['tv_embedded', 'web']}},
 }
 FFMPEG_OPTS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
