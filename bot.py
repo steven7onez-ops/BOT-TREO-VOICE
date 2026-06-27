@@ -456,6 +456,36 @@ async def _play_after(guild_id):
     vc = guild.voice_client
     if vc and not vc.is_playing(): play_next(guild_id, vc)
 
+@bot.command(name="formats", aliases=["fmt"])
+async def formats_cmd(ctx: commands.Context, *, url: str = ""):
+    if not url: await ctx.reply("❌ Cú pháp: `+formats [link YouTube]`"); return
+    msg = await ctx.reply("🔍 Đang kiểm tra formats...")
+    def _check():
+        import os, tempfile
+        cookies_content = os.environ.get("YOUTUBE_COOKIES", "")
+        opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extractor_args': {'youtube': {'player_client': ['tv_embedded', 'web']}},
+        }
+        if cookies_content:
+            tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+            tmp.write(cookies_content); tmp.close()
+            opts['cookiefile'] = tmp.name
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            try:
+                info = ydl.extract_info(url, download=False)
+                fmts = info.get('formats', [])
+                audio = [f for f in fmts if f.get('vcodec') == 'none']
+                lines = [f"`{f['format_id']}` {f.get('ext','?')} {f.get('acodec','?')} {f.get('abr','?')}kbps" for f in audio[:15]]
+                return "\n".join(lines) if lines else "Không có audio format!"
+            except Exception as e:
+                return f"Lỗi: {e}"
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, _check)
+    await msg.edit(content=f"**Formats có sẵn:**\n{result}")
+
+
 @bot.command(name="play", aliases=["ph"])
 async def play_cmd(ctx: commands.Context, *, query: str = ""):
     if not query: await ctx.reply("❌ Cú pháp: `+play [tên bài/link YouTube]`"); return
