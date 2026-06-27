@@ -385,13 +385,17 @@ import yt_dlp
 from collections import deque
 
 YTDL_OPTS = {
-    'format': '140/251/250/249/bestaudio/best',
-    'noplaylist': True,
-    'quiet': False,
-    'no_warnings': False,
-    'default_search': 'ytsearch',
-    'source_address': '0.0.0.0',
-    'extractor_args': {'youtube': {'player_client': ['web']}},
+'format': 'bestaudio/best',
+'noplaylist': True,
+'quiet': False,
+'no_warnings': False,
+'default_search': 'ytsearch',
+'source_address': '0.0.0.0',
+'extractor_args': {
+'youtube': {
+'player_client': ['android', 'ios']
+}
+},
 }
 FFMPEG_OPTS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
