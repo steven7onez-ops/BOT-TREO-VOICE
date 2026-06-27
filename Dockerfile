@@ -1,11 +1,20 @@
-FROM python:3.12-slim
-
-# Cài libopus cho voice Discord
-RUN apt-get update && apt-get install -y libopus0 ffmpeg && rm -rf /var/lib/apt/lists/*
+FROM python:3.11-slim
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py .
-CMD ["python", "-u", "bot.py"]
+RUN apt-get update && apt-get install -y 
+ffmpeg 
+nodejs 
+npm 
+curl 
+&& rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+
+RUN pip install --upgrade pip
+RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade yt-dlp
+
+COPY . .
+
+CMD ["python", "bot.py"]
