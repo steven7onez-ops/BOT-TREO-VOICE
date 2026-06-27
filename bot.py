@@ -262,6 +262,16 @@ async def help_cmd(ctx: commands.Context):
     embed.add_field(name="🔧 Lệnh chung",
         value="`+ping` — Kiểm tra bot còn sống không\n`+help` — Xem danh sách lệnh",
         inline=False)
+    embed.add_field(name="🎵 Nhạc",
+        value="`+play [tên/link]` — Phát nhạc từ YouTube\n"
+              "`+skip` — Bỏ qua bài hiện tại\n"
+              "`+queue` (`+q`) — Xem hàng đợi\n"
+              "`+nowplaying` (`+np`) — Bài đang phát\n"
+              "`+pause` / `+resume` — Tạm dừng / Tiếp tục\n"
+              "`+volume [0-150]` (`+vol`) — Chỉnh âm lượng\n"
+              "`+remove [số]` — Xóa bài khỏi hàng đợi\n"
+              "`+stop` — Dừng nhạc & xóa hàng đợi",
+        inline=False)
     embed.add_field(name="👤 Profile",
         value="`+profile @user` (`+p`) — Xem profile thành viên\n"
               "`+profile_set @user ten:Tên tags:Tag1 | Tag2` (`+pset`) — Tạo/sửa *(Admin)*\n"
