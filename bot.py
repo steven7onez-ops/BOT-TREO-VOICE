@@ -385,13 +385,12 @@ import yt_dlp
 from collections import deque
 
 YTDL_OPTS = {
-    'format': 'best[ext=mp4]/best',
+    'format': 'bestaudio/best',
     'noplaylist': True,
     'quiet': True,
     'no_warnings': True,
     'default_search': 'ytsearch',
     'source_address': '0.0.0.0',
-    'extractor_args': {'youtube': {'player_client': ['mweb', 'web_safari']}},
 }
 FFMPEG_OPTS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
@@ -412,21 +411,29 @@ async def search_yt(query: str):
         import tempfile, os
         opts = dict(YTDL_OPTS)
         # Thử đọc cookies từ file trước
+        # List tất cả files trong /app để debug
+        import glob
+        files = glob.glob('/app/*') + glob.glob('./*')
+        log.info(f"📁 Files: {files}")
+        
         cookie_paths = ['/app/cookies.txt', './cookies.txt', '/tmp/cookies.txt']
+        found = False
         for path in cookie_paths:
             if os.path.exists(path):
                 opts['cookiefile'] = path
                 log.info(f"🍪 Dùng cookies từ file: {path}")
-                break
-        else:
-            # Fallback: đọc từ env var
+                found = True; break
+        
+        if not found:
             cookies_content = os.environ.get("YOUTUBE_COOKIES", "")
             if cookies_content:
                 tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
                 tmp.write(cookies_content)
                 tmp.close()
                 opts['cookiefile'] = tmp.name
-                log.info(f"🍪 Dùng cookies từ env var")
+                log.info(f"🍪 Dùng cookies từ env var ({len(cookies_content)} chars)")
+            else:
+                log.warning("⚠️ Không tìm thấy cookies!")
         with yt_dlp.YoutubeDL(opts) as ydl:
             try:
                 info = ydl.extract_info(query, download=False)
