@@ -1,4 +1,4 @@
-// src/MusicPlayer.js — lõi phát nhạc (play-dl + @discordjs/voice)
+// src/MusicPlayer.js — stream bằng @distube/ytdl-core
 const {
     joinVoiceChannel,
     createAudioPlayer,
@@ -7,9 +7,10 @@ const {
     VoiceConnectionStatus,
     entersState,
     getVoiceConnection,
+    StreamType,
 } = require('@discordjs/voice');
-const playdl = require('play-dl');
-const chalk  = require('chalk');
+const ytdl  = require('@distube/ytdl-core');
+const chalk = require('chalk');
 const PlayerStateManager = require('./PlayerStateManager');
 
 const INACTIVITY_TIMEOUT = 5 * 60 * 1000; // 5 phút
@@ -24,13 +25,13 @@ class MusicPlayer {
         this.currentTrack = null;
         this.audioPlayer  = createAudioPlayer();
         this.connection   = null;
-        this.loop         = false;  // lặp bài
-        this.queueLoop    = false;  // lặp hàng chờ
+        this.loop         = false;
+        this.queueLoop    = false;
         this.volume       = 1.0;
 
-        this.pauseReasons = new Set();
-        this._inactivityTimer = null;
-        this.pendingEndReason = null;
+        this.pauseReasons      = new Set();
+        this._inactivityTimer  = null;
+        this.pendingEndReason  = null;
 
         this.audioPlayer.on(AudioPlayerStatus.Idle, () => this._onTrackEnd());
         this.audioPlayer.on('error', err => {
@@ -42,14 +43,19 @@ class MusicPlayer {
     // ── Kết nối voice ─────────────────────────────────────────────────────────
 
     async connect() {
-        if (this.connection?.state?.status === VoiceConnectionStatus.Ready) return;
+        const existing = getVoiceConnection(this.guild.id);
+        if (existing && existing.state.status === VoiceConnectionStatus.Ready) {
+            this.connection = existing;
+            this.connection.subscribe(this.audioPlayer);
+            return;
+        }
 
         this.connection = joinVoiceChannel({
-            channelId: this.voiceChannel.id,
-            guildId:   this.guild.id,
+            channelId:      this.voiceChannel.id,
+            guildId:        this.guild.id,
             adapterCreator: this.guild.voiceAdapterCreator,
-            selfDeaf:  true,
-            selfMute:  false,
+            selfDeaf:       true,
+            selfMute:       false,
         });
 
         this.connection.subscribe(this.audioPlayer);
@@ -66,22 +72,18 @@ class MusicPlayer {
         });
 
         try {
-            await entersState(this.connection, VoiceConnectionStatus.Ready, 15_000);
+            await entersState(this.connection, VoiceConnectionStatus.Ready, 20_000);
         } catch {
             this.connection.destroy();
-            throw new Error('Không thể kết nối voice channel sau 15 giây.');
+            throw new Error('Không thể kết nối voice channel sau 20 giây.');
         }
     }
 
-    // ── Thêm bài / phát ────────────────────────────────────────────────────────
+    // ── Phát nhạc ─────────────────────────────────────────────────────────────
 
-    /**
-     * Thêm bài vào hàng chờ và phát nếu đang rảnh
-     * @param {Object} track - { title, url, duration, thumbnail, requestedBy }
-     */
     async addTrack(track) {
         this.queue.push(track);
-        if (this.audioPlayer.state.status === AudioPlayerStatus.Idle) {
+        if (this.audioPlayer.state.status === AudioPlayerStatus.Idle && !this.currentTrack) {
             await this._playNext();
         }
     }
@@ -90,8 +92,8 @@ class MusicPlayer {
         if (this.queue.length === 0) {
             this.currentTrack = null;
             this.startInactivityTimer();
-            const embedManager = global.clients?.musicEmbedManager;
-            if (embedManager) await embedManager.handlePlaybackEnd(this);
+            const em = global.clients?.musicEmbedManager;
+            if (em) await em.handlePlaybackEnd(this);
             return;
         }
 
@@ -100,25 +102,32 @@ class MusicPlayer {
 
         try {
             await this.connect();
-            const stream = await playdl.stream(this.currentTrack.url, { quality: 2 });
-            const resource = createAudioResource(stream.stream, {
-                inputType: stream.type,
+
+            // Stream bằng ytdl-core
+            const stream = ytdl(this.currentTrack.url, {
+                filter:  'audioonly',
+                quality: 'highestaudio',
+                highWaterMark: 1 << 25, // 32MB buffer
+            });
+
+            const resource = createAudioResource(stream, {
+                inputType:    StreamType.Arbitrary,
                 inlineVolume: true,
             });
             resource.volume?.setVolume(this.volume);
-            this.audioPlayer.play(resource);
 
+            this.audioPlayer.play(resource);
             console.log(chalk.green(`▶ Đang phát: ${this.currentTrack.title}`));
 
-            const embedManager = global.clients?.musicEmbedManager;
-            if (embedManager) await embedManager.updateNowPlayingEmbed(this);
+            const em = global.clients?.musicEmbedManager;
+            if (em) await em.updateNowPlayingEmbed(this);
 
             await this.persistState('play');
         } catch (err) {
-            console.error(chalk.red(`❌ Lỗi phát nhạc: ${err.message}`));
+            console.error(chalk.red(`❌ Lỗi phát: ${err.message}`));
             this.textChannel?.send(`❌ Không thể phát **${this.currentTrack?.title}**: ${err.message}`).catch(() => {});
             this.currentTrack = null;
-            await this._playNext();
+            setTimeout(() => this._playNext(), 1000);
         }
     }
 
@@ -128,6 +137,7 @@ class MusicPlayer {
         } else if (this.queueLoop && this.currentTrack) {
             this.queue.push(this.currentTrack);
         }
+        this.currentTrack = null;
         this._playNext();
     }
 
@@ -160,7 +170,7 @@ class MusicPlayer {
     }
 
     stop() {
-        this.queue = [];
+        this.queue        = [];
         this.currentTrack = null;
         this.audioPlayer.stop(true);
     }
@@ -174,7 +184,6 @@ class MusicPlayer {
 
     setVolume(pct) {
         this.volume = Math.max(0, Math.min(2, pct / 100));
-        // Áp dụng ngay nếu đang phát
         const resource = this.audioPlayer.state?.resource;
         if (resource?.volume) resource.volume.setVolume(this.volume);
     }
@@ -183,8 +192,8 @@ class MusicPlayer {
         this.voiceChannel = newChannel;
         if (this.connection) {
             const newConn = joinVoiceChannel({
-                channelId: newChannel.id,
-                guildId:   this.guild.id,
+                channelId:      newChannel.id,
+                guildId:        this.guild.id,
                 adapterCreator: this.guild.voiceAdapterCreator,
                 selfDeaf: true,
                 selfMute: false,
@@ -194,12 +203,12 @@ class MusicPlayer {
         }
     }
 
-    // ── Inactivity timer ───────────────────────────────────────────────────────
+    // ── Inactivity ─────────────────────────────────────────────────────────────
 
     startInactivityTimer() {
         this.clearInactivityTimer(false);
         this._inactivityTimer = setTimeout(async () => {
-            console.log(chalk.yellow(`⏰ Không có ai nghe nhạc — bot tự rời kênh`));
+            console.log(chalk.yellow('⏰ Không có ai nghe — bot tự rời'));
             this.textChannel?.send('⏰ Không có ai trong kênh, bot tự rời sau 5 phút.').catch(() => {});
             this.cleanup();
         }, INACTIVITY_TIMEOUT);
@@ -218,14 +227,14 @@ class MusicPlayer {
     async persistState(reason = 'update', immediate = false) {
         if (!this.guild) return;
         const state = {
-            guildId:       this.guild.id,
+            guildId:        this.guild.id,
             voiceChannelId: this.voiceChannel?.id,
             textChannelId:  this.textChannel?.id,
-            currentTrack:  this.currentTrack,
-            queue:         this.queue,
-            loop:          this.loop,
-            queueLoop:     this.queueLoop,
-            volume:        this.volume,
+            currentTrack:   this.currentTrack,
+            queue:          this.queue,
+            loop:           this.loop,
+            queueLoop:      this.queueLoop,
+            volume:         this.volume,
             reason,
         };
         await PlayerStateManager.saveState(this.guild.id, state);
@@ -235,15 +244,9 @@ class MusicPlayer {
         this.loop      = state.loop      ?? false;
         this.queueLoop = state.queueLoop ?? false;
         this.volume    = state.volume    ?? 1.0;
-
-        if (state.currentTrack) {
-            this.queue.unshift(state.currentTrack);
-        }
+        if (state.currentTrack) this.queue.unshift(state.currentTrack);
         this.queue.push(...(state.queue || []));
-
-        if (this.queue.length > 0) {
-            await this._playNext();
-        }
+        if (this.queue.length > 0) await this._playNext();
     }
 
     // ── Cleanup ────────────────────────────────────────────────────────────────
