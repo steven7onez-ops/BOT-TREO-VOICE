@@ -372,85 +372,87 @@ class KickSelect(discord.ui.UserSelect):
 
 
 class VoiceManagerImpl:
+    """
+    Tự động phát hiện MỌI kênh voice mới được tạo trong server (kể cả qua nút
+    "Create Channel" có sẵn của Discord, không chỉ qua hub do bot tạo), rồi
+    gửi panel điều khiển ngay khi có người đầu tiên vào kênh đó.
+
+    Cách hoạt động:
+    - on_guild_channel_create: ghi nhớ kênh voice vừa tạo (chưa gửi panel vội,
+      vì lúc này channel có thể chưa có ai / people chưa join xong)
+    - on_voice_state_update: khi phát hiện có người vào 1 kênh voice mà kênh đó
+      "mới tinh" (chưa từng có panel, và không phải kênh vĩnh viễn/hub cấu hình
+      riêng) → gán người đó làm chủ, gửi panel lần đầu
+    - Khi kênh trống lại (0 người thật) → xoá state (không xoá kênh, vì đây là
+      kênh Discord tự quản lý qua tính năng Create Channel, nó tự dọn hoặc giữ
+      tuỳ cấu hình server, bot không nên tự ý xoá kênh gốc)
+    """
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        # Cache các channel ID KHÔNG áp dụng panel (kênh vĩnh viễn treo voice, v.v.)
+        self._excluded_ids: set[int] = set()
+
+    def _is_excluded(self, channel_id: int) -> bool:
+        if channel_id == bot.permanent_channel_id:
+            return True
+        return channel_id in self._excluded_ids
 
     async def handle_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
         guild = member.guild
-        cfg_all = load_vc_config()
-        cfg = cfg_all.get(str(guild.id))
-        if not cfg: return
 
-        hub_id = cfg.get("hub_channel_id")
+        # ── Có người vào 1 kênh voice ──────────────────────────────────────────
+        if after.channel and after.channel != before.channel:
+            channel = after.channel
+            if not self._is_excluded(channel.id):
+                state_all = load_vc_state()
+                key = str(channel.id)
+                if key not in state_all:
+                    # Kênh này chưa từng có panel → coi là kênh mới, gán panel lần đầu
+                    await self._init_panel(channel, member)
 
-        # ── Join vào hub → tạo kênh tạm thời mới ──────────────────────────────
-        if after.channel and after.channel.id == hub_id:
-            await self._create_temp_channel(member, guild, cfg)
-
-        # ── Rời khỏi kênh tạm thời → nếu trống thì xoá ────────────────────────
-        if before.channel and before.channel.id != hub_id:
+        # ── Rời khỏi 1 kênh đang được quản lý → nếu trống thì dọn state ───────
+        if before.channel and before.channel != after.channel:
             state_all = load_vc_state()
-            if str(before.channel.id) in state_all:
+            key = str(before.channel.id)
+            if key in state_all:
                 real_members = [m for m in before.channel.members if not m.bot]
                 if len(real_members) == 0:
-                    await self._delete_temp_channel(before.channel)
+                    await self._cleanup_channel(before.channel)
 
-    async def _create_temp_channel(self, member: discord.Member, guild: discord.Guild, cfg: dict):
-        category = None
-        if cfg.get("category_id"):
-            category = guild.get_channel(cfg["category_id"])
-
-        name_template = cfg.get("name_template", "🔊 Kênh của {user}")
-        channel_name = name_template.replace("{user}", member.display_name)[:100]
-
-        new_channel = await guild.create_voice_channel(
-            name=channel_name,
-            category=category,
-            reason=f"Kênh tạm thời cho {member}"
-        )
-        await member.move_to(new_channel)
-
-        # Tạo text channel gắn với voice channel (Discord tự động có "kênh chat trong voice")
-        # Lưu trạng thái
+    async def _init_panel(self, channel: discord.VoiceChannel, first_member: discord.Member):
+        """Gán chủ kênh = người đầu tiên vào, gửi panel lần đầu."""
         state_all = load_vc_state()
-        state_all[str(new_channel.id)] = {
-            "owner_id": member.id,
+        state_all[str(channel.id)] = {
+            "owner_id": first_member.id,
             "panel_message_id": None,
-            "panel_channel_id": None,
             "locked": False,
             "hidden": False,
         }
         save_vc_state(state_all)
+        await self._send_panel(channel, first_member)
+        log.info(f"🆕 Phát hiện kênh mới: {channel.name} — chủ: {first_member}")
 
-        # Gửi panel đầu tiên vào voice-text-chat
-        await self._send_panel(new_channel, member)
-        log.info(f"🆕 Đã tạo kênh tạm thời: {new_channel.name} cho {member}")
-
-    async def _delete_temp_channel(self, channel: discord.VoiceChannel):
-        try:
-            await channel.delete(reason="Kênh tạm thời trống")
-            state_all = load_vc_state()
-            state_all.pop(str(channel.id), None)
-            save_vc_state(state_all)
-            log.info(f"🗑️ Đã xoá kênh tạm thời: {channel.name}")
-        except discord.NotFound:
-            pass
-        except Exception as e:
-            log.error(f"❌ Lỗi xoá kênh: {e}")
+    async def _cleanup_channel(self, channel: discord.VoiceChannel):
+        """Kênh trống — dọn dữ liệu panel. Không xoá kênh vì đây là kênh do
+        tính năng Create Channel gốc của Discord quản lý vòng đời."""
+        state_all = load_vc_state()
+        state_all.pop(str(channel.id), None)
+        save_vc_state(state_all)
+        log.info(f"🧹 Dọn dữ liệu panel: {channel.name} (kênh trống)")
 
     async def _send_panel(self, channel: discord.VoiceChannel, owner: discord.Member):
-        """Gửi bảng điều khiển vào kênh chat gắn với voice channel."""
         try:
             state_all = load_vc_state()
             state = state_all.get(str(channel.id), {})
             embed = build_panel_embed(channel, owner, state)
             view = VoicePanelView(channel.id)
-            # channel (VoiceChannel) hỗ trợ gửi tin nhắn trực tiếp (voice text chat)
             msg = await channel.send(embed=embed, view=view)
             state["panel_message_id"] = msg.id
-            state["panel_channel_id"] = channel.id
             state_all[str(channel.id)] = state
             save_vc_state(state_all)
+        except discord.Forbidden:
+            log.error(f"❌ Bot thiếu quyền gửi tin nhắn trong #{channel.name}")
         except Exception as e:
             log.error(f"❌ Lỗi gửi panel: {e}")
 
@@ -463,7 +465,6 @@ class VoiceManagerImpl:
         owner = channel.guild.get_member(state.get("owner_id"))
         if not owner: return
 
-        # Xoá panel cũ
         old_msg_id = state.get("panel_message_id")
         if old_msg_id:
             try:
@@ -472,7 +473,6 @@ class VoiceManagerImpl:
             except (discord.NotFound, discord.Forbidden):
                 pass
 
-        # Gửi panel mới
         embed = build_panel_embed(channel, owner, state)
         view = VoicePanelView(channel.id)
         msg = await channel.send(embed=embed, view=view)
@@ -481,7 +481,6 @@ class VoiceManagerImpl:
         save_vc_state(state_all)
 
     async def refresh_panel(self, channel: discord.VoiceChannel):
-        """Cập nhật nội dung panel hiện tại (không xoá/gửi lại)."""
         state_all = load_vc_state()
         state = state_all.get(str(channel.id))
         if not state or not state.get("panel_message_id"): return
@@ -496,6 +495,10 @@ class VoiceManagerImpl:
     def is_temp_channel(self, channel_id: int) -> bool:
         state_all = load_vc_state()
         return str(channel_id) in state_all
+
+    def exclude_channel(self, channel_id: int):
+        """Đánh dấu 1 kênh KHÔNG bao giờ nhận panel (dùng cho kênh vĩnh viễn treo voice)."""
+        self._excluded_ids.add(channel_id)
 
 
 voice_manager = VoiceManagerImpl(bot)
@@ -521,56 +524,12 @@ def is_admin():
     return app_commands.check(predicate)
 
 
-@bot.tree.command(name="voice_setup", description="[Admin] Tạo kênh hub để mọi người join vào tạo kênh tạm thời")
-@app_commands.describe(
-    ten_hub="Tên kênh hub (vd: ➕ Tạo kênh thoại)",
-    category="Danh mục để đặt các kênh tạm thời vào (tuỳ chọn)",
-    mau_ten="Mẫu tên kênh tạm thời, dùng {user} để thay tên người tạo"
-)
+@bot.tree.command(name="voice_exclude", description="[Admin] Loại trừ 1 kênh khỏi Voice Manager (không tự gửi panel)")
+@app_commands.describe(kenh="Kênh voice cần loại trừ (vd: kênh AFK, kênh vĩnh viễn)")
 @is_admin()
-async def voice_setup(interaction: discord.Interaction,
-                       ten_hub: str = "➕ Tạo kênh thoại",
-                       category: discord.CategoryChannel = None,
-                       mau_ten: str = "🔊 Kênh của {user}"):
-    guild = interaction.guild
-    hub_channel = await guild.create_voice_channel(name=ten_hub, category=category, reason="Voice Manager hub")
-
-    cfg_all = load_vc_config()
-    cfg_all[str(guild.id)] = {
-        "hub_channel_id": hub_channel.id,
-        "category_id": category.id if category else None,
-        "name_template": mau_ten,
-    }
-    save_vc_config(cfg_all)
-
-    await interaction.response.send_message(
-        f"✅ Đã tạo hub: {hub_channel.mention}\n"
-        f"Ai vào kênh này sẽ tự động có kênh voice riêng!\n"
-        f"Mẫu tên: `{mau_ten}`",
-        ephemeral=True
-    )
-
-
-@bot.tree.command(name="voice_config", description="[Admin] Sửa cấu hình Voice Manager hiện tại")
-@app_commands.describe(
-    hub="Chọn lại kênh hub (nếu muốn dùng kênh có sẵn)",
-    category="Danh mục đặt kênh tạm thời",
-    mau_ten="Mẫu tên kênh tạm thời, dùng {user} để thay tên"
-)
-@is_admin()
-async def voice_config(interaction: discord.Interaction,
-                        hub: discord.VoiceChannel = None,
-                        category: discord.CategoryChannel = None,
-                        mau_ten: str = None):
-    guild_id = str(interaction.guild.id)
-    cfg_all = load_vc_config()
-    cfg = cfg_all.get(guild_id, {})
-    if hub: cfg["hub_channel_id"] = hub.id
-    if category: cfg["category_id"] = category.id
-    if mau_ten: cfg["name_template"] = mau_ten
-    cfg_all[guild_id] = cfg
-    save_vc_config(cfg_all)
-    await interaction.response.send_message("✅ Đã cập nhật cấu hình Voice Manager!", ephemeral=True)
+async def voice_exclude(interaction: discord.Interaction, kenh: discord.VoiceChannel):
+    voice_manager.exclude_channel(kenh.id)
+    await interaction.response.send_message(f"✅ Đã loại trừ {kenh.mention} khỏi Voice Manager!", ephemeral=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -721,8 +680,7 @@ async def profile_delete(interaction: discord.Interaction, thanh_vien: discord.M
 @profile_addphoto.error
 @profile_removephoto.error
 @profile_delete.error
-@voice_setup.error
-@voice_config.error
+@voice_exclude.error
 async def admin_error(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.CheckFailure):
         await interaction.response.send_message("❌ Bạn cần quyền **Quản lý server** để dùng lệnh này!", ephemeral=True)
@@ -748,9 +706,10 @@ async def ping(ctx: commands.Context):
 async def help_cmd(ctx: commands.Context):
     embed = discord.Embed(title="📖 Danh sách lệnh", color=0x5865f2)
     embed.add_field(name="🔧 Lệnh chung", value="`+ping` — Kiểm tra bot\n`+help` — Danh sách lệnh", inline=False)
-    embed.add_field(name="🎙️ Voice Manager (Slash)",
-        value="`/voice_setup` — Tạo hub tạo kênh tạm thời *(Admin)*\n"
-              "`/voice_config` — Sửa cấu hình *(Admin)*",
+    embed.add_field(name="🎙️ Voice Manager",
+        value="Tự động! Ai vào kênh voice mới (kể cả qua nút Create Channel gốc "
+              "của Discord) sẽ tự nhận panel điều khiển ngay.\n"
+              "`/voice_exclude` — Loại trừ 1 kênh khỏi Voice Manager *(Admin)*",
         inline=False)
     embed.add_field(name="👤 Profile (Slash)",
         value="`/profile @user` — Xem profile\n"
