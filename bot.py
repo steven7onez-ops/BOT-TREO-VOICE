@@ -599,8 +599,254 @@ async def help_cmd(ctx: commands.Context):
               "`/profile_removephoto` — Xóa ảnh *(Admin)*\n"
               "`/profile_delete` — Xóa profile *(Admin)*",
         inline=False)
+    embed.add_field(name="⭕❌ Cờ Caro 10x10",
+        value="`+caro @user` — Thách đấu 1 người\n"
+              "`+caro` — Đấu với Bot (AI)\n"
+              "`+danh <hàng> <cột>` (`+d`) — Đánh quân, vd: `+danh 5 7` hoặc `+danh E7`\n"
+              "`+caro_end` — Huỷ ván đang chơi",
+        inline=False)
     embed.set_footer(text=f"Prefix: + | Bot: {bot.user}")
     await ctx.reply(embed=embed)
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CỜ CARO (GOMOKU) 10x10
+# ══════════════════════════════════════════════════════════════════════════════
+CARO_SIZE = 10
+CARO_EMPTY, CARO_X, CARO_O = 0, 1, 2
+CARO_SYMBOLS = {CARO_EMPTY: "⬜", CARO_X: "❌", CARO_O: "⭕"}
+CARO_COLS = "ABCDEFGHIJ"  # cột A-J tương ứng 1-10
+
+# games đang diễn ra, key = channel_id
+caro_games: dict[int, dict] = {}
+
+def caro_new_board():
+    return [[CARO_EMPTY for _ in range(CARO_SIZE)] for _ in range(CARO_SIZE)]
+
+def caro_render(game: dict) -> str:
+    board = game["board"]
+    header = "⬛" + "".join(f"{i+1:>2}"[-1] + "\u200b" for i in range(CARO_SIZE))
+    # Dùng emoji số để căn đều hơn
+    num_emoji = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
+    lines = ["⬛" + "".join(num_emoji)]
+    for r in range(CARO_SIZE):
+        row_label = f"{CARO_COLS[r]}"
+        row_str = "".join(CARO_SYMBOLS[board[r][c]] for c in range(CARO_SIZE))
+        lines.append(f"🔹{row_str}")
+    return "\n".join(lines)
+
+def caro_in_bounds(r, c): return 0 <= r < CARO_SIZE and 0 <= c < CARO_SIZE
+
+def caro_check_win(board, r, c, player) -> bool:
+    directions = [(0,1), (1,0), (1,1), (1,-1)]
+    for dr, dc in directions:
+        count = 1
+        for sign in (1, -1):
+            rr, cc = r + dr*sign, c + dc*sign
+            while caro_in_bounds(rr, cc) and board[rr][cc] == player:
+                count += 1
+                rr += dr*sign; cc += dc*sign
+        if count >= 5:
+            return True
+    return False
+
+def caro_is_full(board) -> bool:
+    return all(cell != CARO_EMPTY for row in board for cell in row)
+
+def caro_parse_pos(text: str):
+    """Parse '5 7' hoặc 'A5' hoặc '5A' thành (row, col) 0-indexed. Trả None nếu sai."""
+    text = text.strip().upper().replace(",", " ")
+    parts = text.split()
+    try:
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            row = int(parts[0]) - 1
+            col = int(parts[1]) - 1
+            if caro_in_bounds(row, col): return (row, col)
+            return None
+        if len(parts) == 1:
+            s = parts[0]
+            # dạng A5 hoặc 5A
+            if s[0] in CARO_COLS and s[1:].isdigit():
+                row = CARO_COLS.index(s[0]); col = int(s[1:]) - 1
+                if caro_in_bounds(row, col): return (row, col)
+            if s[-1] in CARO_COLS and s[:-1].isdigit():
+                row = CARO_COLS.index(s[-1]); col = int(s[:-1]) - 1
+                if caro_in_bounds(row, col): return (row, col)
+    except Exception:
+        return None
+    return None
+
+def caro_ai_move(board, ai_player, human_player):
+    """AI đơn giản: ưu tiên (1) thắng ngay, (2) chặn đối thủ thắng, (3) đánh cạnh quân gần trung tâm nhất có điểm cao nhất theo heuristic."""
+    empties = [(r, c) for r in range(CARO_SIZE) for c in range(CARO_SIZE) if board[r][c] == CARO_EMPTY]
+    if not empties:
+        return None
+
+    # 1) Thử thắng ngay
+    for (r, c) in empties:
+        board[r][c] = ai_player
+        if caro_check_win(board, r, c, ai_player):
+            board[r][c] = CARO_EMPTY
+            return (r, c)
+        board[r][c] = CARO_EMPTY
+
+    # 2) Chặn đối thủ thắng
+    for (r, c) in empties:
+        board[r][c] = human_player
+        if caro_check_win(board, r, c, human_player):
+            board[r][c] = CARO_EMPTY
+            return (r, c)
+        board[r][c] = CARO_EMPTY
+
+    # 3) Heuristic: chấm điểm từng ô trống dựa trên số quân liền kề (bán kính 2)
+    def score_cell(r, c, player):
+        score = 0
+        for dr in range(-2, 3):
+            for dc in range(-2, 3):
+                if dr == 0 and dc == 0: continue
+                rr, cc = r+dr, c+dc
+                if caro_in_bounds(rr, cc) and board[rr][cc] == player:
+                    dist = max(abs(dr), abs(dc))
+                    score += (3 - dist) if dist <= 2 else 0
+        return score
+
+    best_cell, best_score = None, -1
+    for (r, c) in empties:
+        s = score_cell(r, c, ai_player) * 2 + score_cell(r, c, human_player)
+        # ưu tiên gần trung tâm nếu bàn còn trống nhiều
+        center_bonus = -(abs(r - 4.5) + abs(c - 4.5)) * 0.1
+        s += center_bonus
+        if s > best_score:
+            best_score, best_cell = s, (r, c)
+    return best_cell
+
+
+@bot.command(name="caro", aliases=["gomoku"])
+async def caro_start(ctx: commands.Context, doi_thu: discord.Member = None):
+    """+caro @user để đấu người, +caro (không tag ai) để đấu bot."""
+    channel_id = ctx.channel.id
+    if channel_id in caro_games:
+        return await ctx.reply("⚠️ Kênh này đang có 1 ván cờ chưa kết thúc! Dùng `+caro_end` để huỷ ván cũ trước.")
+
+    vs_bot = doi_thu is None or doi_thu.bot
+    if doi_thu and doi_thu.id == ctx.author.id:
+        return await ctx.reply("❌ Không thể tự đấu với chính mình!")
+
+    game = {
+        "board": caro_new_board(),
+        "players": {CARO_X: ctx.author.id, CARO_O: (bot.user.id if vs_bot else doi_thu.id)},
+        "names": {CARO_X: ctx.author.display_name, CARO_O: ("🤖 Bot" if vs_bot else doi_thu.display_name)},
+        "turn": CARO_X,
+        "vs_bot": vs_bot,
+        "channel_id": channel_id,
+    }
+    caro_games[channel_id] = game
+
+    embed = discord.Embed(
+        title="⭕❌ Cờ Caro 10x10 (Gomoku)",
+        description=(
+            f"{caro_render(game)}\n\n"
+            f"❌ **{game['names'][CARO_X]}**  vs  ⭕ **{game['names'][CARO_O]}**\n"
+            f"👉 Lượt của: **{game['names'][game['turn']]}**\n\n"
+            f"Đánh bằng lệnh: `+danh <hàng> <cột>` (vd: `+danh 5 7`) hoặc `+danh E7`"
+        ),
+        color=0x5865F2
+    )
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="danh", aliases=["move", "d"])
+async def caro_move(ctx: commands.Context, *, pos: str = ""):
+    channel_id = ctx.channel.id
+    game = caro_games.get(channel_id)
+    if not game:
+        return await ctx.reply("❌ Không có ván cờ nào đang diễn ra trong kênh này! Dùng `+caro` để bắt đầu.")
+
+    turn_player_id = game["players"][game["turn"]]
+    if ctx.author.id != turn_player_id:
+        return await ctx.reply(f"⏳ Chưa đến lượt bạn! Đang chờ **{game['names'][game['turn']]}**.")
+
+    parsed = caro_parse_pos(pos)
+    if not parsed:
+        return await ctx.reply("❌ Vị trí không hợp lệ! Dùng dạng `+danh 5 7` (hàng cột, 1-10) hoặc `+danh E7`.")
+
+    r, c = parsed
+    if game["board"][r][c] != CARO_EMPTY:
+        return await ctx.reply("❌ Ô này đã có quân rồi!")
+
+    board = game["board"]
+    player = game["turn"]
+    board[r][c] = player
+
+    if caro_check_win(board, r, c, player):
+        embed = discord.Embed(
+            title="🏆 Kết thúc ván cờ!",
+            description=f"{caro_render(game)}\n\n🎉 **{game['names'][player]}** đã thắng!",
+            color=0x3BA55D
+        )
+        del caro_games[channel_id]
+        return await ctx.reply(embed=embed)
+
+    if caro_is_full(board):
+        embed = discord.Embed(
+            title="🤝 Hoà!",
+            description=f"{caro_render(game)}\n\nBàn cờ đã đầy, ván cờ kết thúc hoà!",
+            color=0xFAA61A
+        )
+        del caro_games[channel_id]
+        return await ctx.reply(embed=embed)
+
+    # Chuyển lượt
+    game["turn"] = CARO_O if player == CARO_X else CARO_X
+
+    # Nếu đấu bot và đến lượt bot
+    if game["vs_bot"] and game["turn"] == CARO_O:
+        ai_pos = caro_ai_move(board, CARO_O, CARO_X)
+        if ai_pos:
+            ar, ac = ai_pos
+            board[ar][ac] = CARO_O
+            if caro_check_win(board, ar, ac, CARO_O):
+                embed = discord.Embed(
+                    title="🏆 Kết thúc ván cờ!",
+                    description=f"{caro_render(game)}\n\n🤖 **Bot** đã thắng! Chúc may mắn lần sau 😄",
+                    color=0xED4245
+                )
+                del caro_games[channel_id]
+                return await ctx.reply(embed=embed)
+            if caro_is_full(board):
+                embed = discord.Embed(
+                    title="🤝 Hoà!",
+                    description=f"{caro_render(game)}\n\nBàn cờ đã đầy, ván cờ kết thúc hoà!",
+                    color=0xFAA61A
+                )
+                del caro_games[channel_id]
+                return await ctx.reply(embed=embed)
+            game["turn"] = CARO_X
+
+    embed = discord.Embed(
+        title="⭕❌ Cờ Caro 10x10 (Gomoku)",
+        description=(
+            f"{caro_render(game)}\n\n"
+            f"❌ **{game['names'][CARO_X]}**  vs  ⭕ **{game['names'][CARO_O]}**\n"
+            f"👉 Lượt của: **{game['names'][game['turn']]}**"
+        ),
+        color=0x5865F2
+    )
+    await ctx.reply(embed=embed)
+
+
+@bot.command(name="caro_end", aliases=["caro_huy"])
+async def caro_end(ctx: commands.Context):
+    channel_id = ctx.channel.id
+    if channel_id not in caro_games:
+        return await ctx.reply("❌ Không có ván cờ nào đang diễn ra trong kênh này!")
+    game = caro_games[channel_id]
+    if ctx.author.id not in game["players"].values() and not ctx.author.guild_permissions.manage_messages:
+        return await ctx.reply("❌ Chỉ người chơi hoặc mod mới huỷ được ván cờ!")
+    del caro_games[channel_id]
+    await ctx.reply("🛑 Đã huỷ ván cờ trong kênh này.")
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
