@@ -395,17 +395,90 @@ async def voice_control_cmd(ctx: commands.Context):
         pass
 
 
-# ── Lắng nghe chat trong kênh voice đang có panel để re-post xuống dưới cùng ──
+# ══════════════════════════════════════════════════════════════════════════════
+#  AFK SYSTEM
+# ══════════════════════════════════════════════════════════════════════════════
+afk_data: dict[int, dict] = {}
+
+def fmt_duration(dt: datetime) -> str:
+    diff = datetime.now(timezone.utc) - dt
+    s = int(diff.total_seconds())
+    if s < 60: return f"{s} giây"
+    if s < 3600: return f"{s//60} phút"
+    if s < 86400: return f"{s//3600} giờ {(s%3600)//60} phút"
+    return f"{s//86400} ngày {(s%86400)//3600} giờ"
+
+
+@bot.command(name="afk")
+async def afk_cmd(ctx: commands.Context, *, reason: str = "Không có lý do"):
+    uid = ctx.author.id
+    if uid in afk_data:
+        return await ctx.reply("⚠️ Bạn đang AFK rồi! Gõ bất kỳ tin nhắn nào để tắt AFK.")
+    old_nick = ctx.author.nick
+    afk_data[uid] = {
+        "reason": reason[:100],
+        "since": datetime.now(timezone.utc),
+        "guild_id": ctx.guild.id,
+        "old_nick": old_nick,
+    }
+    new_nick = f"[AFK] {ctx.author.display_name}"[:32]
+    try:
+        await ctx.author.edit(nick=new_nick)
+    except discord.Forbidden:
+        pass
+    embed = discord.Embed(
+        description=f"💤 **{ctx.author.display_name}** đã AFK\n📝 Lý do: **{reason}**",
+        color=0x9090a8
+    )
+    await ctx.reply(embed=embed, delete_after=10)
+    try: await ctx.message.delete()
+    except: pass
+
+
+# ── on_message tích hợp: AFK + Voice Manager repost panel ────────────────────
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
+
+    uid = message.author.id
+    content = message.content.strip()
+
+    # Tắt AFK khi gõ tin nhắn (trừ lệnh +afk chính nó)
+    if uid in afk_data and not content.lower().startswith("+afk"):
+        data = afk_data.pop(uid)
+        duration = fmt_duration(data["since"])
+        try:
+            await message.author.edit(nick=data["old_nick"])
+        except discord.Forbidden:
+            pass
+        embed = discord.Embed(
+            description=f"✅ **{message.author.display_name}** đã trở lại sau **{duration}** AFK!",
+            color=0x3ba55d
+        )
+        await message.channel.send(embed=embed, delete_after=8)
+
+    # Ai đó tag người đang AFK
+    for mentioned in message.mentions:
+        mid = mentioned.id
+        if mid in afk_data and mid != uid:
+            data = afk_data[mid]
+            duration = fmt_duration(data["since"])
+            embed = discord.Embed(
+                description=(
+                    f"💤 **{mentioned.display_name}** đang AFK!\n"
+                    f"📝 Lý do: **{data['reason']}**\n"
+                    f"⏱️ Đã AFK được: **{duration}**"
+                ),
+                color=0x9090a8
+            )
+            await message.channel.send(embed=embed, delete_after=10)
+
+    # Voice Manager: repost panel khi có tin nhắn mới trong kênh voice
     if isinstance(message.channel, discord.VoiceChannel) and voice_manager.is_managed_channel(message.channel.id):
-        # Nếu chính tin nhắn này là lệnh +voice_control thì để command xử lý,
-        # tránh việc repost 2 lần liên tiếp.
-        content = message.content.strip()
         if not (content.startswith("+voice_control") or content.startswith("+vc") or content.startswith("+voicecontrol")):
             await voice_manager.repost_panel(message.channel)
+
     await bot.process_commands(message)
 
 
@@ -604,6 +677,11 @@ async def help_cmd(ctx: commands.Context):
               "`+caro` — Đấu với Bot (AI)\n"
               "`+danh <hàng> <cột>` (`+d`) — Đánh quân, vd: `+danh 5 7` hoặc `+danh E7`\n"
               "`+caro_end` — Huỷ ván đang chơi",
+        inline=False)
+    embed.add_field(name="💤 AFK",
+        value="`+afk [lý do]` — Bật AFK, vd: `+afk đi ngủ`\n"
+              "Tự tắt khi bạn gõ tin nhắn bất kỳ\n"
+              "Bot sẽ báo mọi người khi có ai tag bạn lúc AFK",
         inline=False)
     embed.set_footer(text=f"Prefix: + | Bot: {bot.user}")
     await ctx.reply(embed=embed)
