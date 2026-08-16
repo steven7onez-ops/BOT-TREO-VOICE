@@ -151,7 +151,6 @@ import base64
 
 # Build yt-dlp options and support cookie injection via env vars
 YTDL_OPTS = {
-    'format': 'bestaudio/best',
     'quiet': True,
     'no_warnings': True,
     'ignoreerrors': True,
@@ -215,6 +214,7 @@ class YTDLSource:
                 raise RuntimeError(f'yt-dlp error: {s}')
         if data is None:
             raise RuntimeError('No data from yt-dlp')
+        log.debug('yt-dlp returned data keys: %s', list(data.keys()) if isinstance(data, dict) else None)
         if 'entries' in data:
             entries = [e for e in data['entries'] if e]
             if not entries:
@@ -235,6 +235,7 @@ class YTDLSource:
                         break
                 except Exception:
                     continue
+            log.debug('Found %d formats, selected stream_url=%s', len(info.get('formats', [])), bool(stream_url))
         # fallback to top-level url
         if not stream_url:
             stream_url = info.get('url')
