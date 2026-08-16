@@ -190,30 +190,62 @@ class YTDLSource:
         def extract():
             with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
                 return ydl.extract_info(search, download=False)
+
         try:
             data = await asyncio.to_thread(extract)
         except Exception as exc:
             s = str(exc)
-            if 'Sign in to confirm' in s or 'cookies' in s.lower():
-                raise RuntimeError(
-                    'YouTube requires cookies to access this video.\n'
-                    'Provide cookies via env `YTDL_COOKIE_FILE` (path) or `YTDL_COOKIES_BASE64` (base64-encoded cookies.txt).'
-                )
-            raise RuntimeError(f'yt-dlp error: {s}')
+            # if format not available, retry without forcing format
+            if 'Requested format is not available' in s:
+                try:
+                    alt_opts = dict(YTDL_OPTS)
+                    alt_opts.pop('format', None)
+                    def extract_alt():
+                        with yt_dlp.YoutubeDL(alt_opts) as ydl:
+                            return ydl.extract_info(search, download=False)
+                    data = await asyncio.to_thread(extract_alt)
+                except Exception:
+                    data = None
+            if data is None:
+                if 'Sign in to confirm' in s or 'cookies' in s.lower():
+                    raise RuntimeError(
+                        'YouTube requires cookies to access this video.\n'
+                        'Provide cookies via env `YTDL_COOKIE_FILE` (path) or `YTDL_COOKIES_BASE64` (base64-encoded cookies.txt).'
+                    )
+                raise RuntimeError(f'yt-dlp error: {s}')
         if data is None:
             raise RuntimeError('No data from yt-dlp')
         if 'entries' in data:
-            # playlist or search result — pick first entry
             entries = [e for e in data['entries'] if e]
             if not entries:
                 raise RuntimeError('No entries found')
             info = entries[0]
         else:
             info = data
+
+        # Prefer a direct audio format URL from `formats` if available
+        stream_url = None
+        if info.get('formats'):
+            # iterate from best to worst (formats often ordered), prefer audio codecs
+            for fmt in reversed(info['formats']):
+                try:
+                    # prefer audio-only or with audio
+                    if fmt.get('acodec') and fmt.get('acodec') != 'none' and fmt.get('url'):
+                        stream_url = fmt.get('url')
+                        break
+                except Exception:
+                    continue
+        # fallback to top-level url
+        if not stream_url:
+            stream_url = info.get('url')
+
+        if not stream_url:
+            raise RuntimeError('Could not find playable stream URL in yt-dlp info')
+
         return {
             'webpage_url': info.get('webpage_url'),
             'title': info.get('title'),
-            'url': info.get('url') or info.get('webpage_url'),
+            'url': stream_url,
             'duration': info.get('duration'),
         }
 
