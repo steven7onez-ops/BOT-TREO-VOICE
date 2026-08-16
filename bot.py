@@ -240,6 +240,46 @@ class YTDLSource:
         if not stream_url:
             stream_url = info.get('url')
 
+        # If we still don't have a stream_url, try CLI fallback (yt-dlp executable)
+        if not stream_url:
+            try:
+                ytdlp_cli = shutil.which('yt-dlp')
+                if ytdlp_cli:
+                    log.info('Attempting yt-dlp CLI fallback for %s', search)
+                    cli_cmd = [ytdlp_cli, '-J', search]
+                    if COOKIE_FILE:
+                        cli_cmd += ['--cookies', COOKIE_FILE]
+                    p = subprocess.run(cli_cmd, capture_output=True, text=True, timeout=30)
+                    if p.returncode == 0 and p.stdout:
+                        try:
+                            j = json.loads(p.stdout)
+                            # pick first entry if playlist
+                            jinfo = j['entries'][0] if 'entries' in j and j['entries'] else j
+                            # prefer formats
+                            if jinfo.get('formats'):
+                                for fmt in reversed(jinfo['formats']):
+                                    if fmt.get('acodec') and fmt.get('acodec') != 'none' and fmt.get('url'):
+                                        stream_url = fmt.get('url')
+                                        break
+                            if not stream_url:
+                                stream_url = jinfo.get('url')
+                            info = jinfo
+                        except Exception:
+                            stream_url = None
+                    else:
+                        # try get-url with bestaudio
+                        cli_cmd2 = [ytdlp_cli, '-f', 'bestaudio', '-g', search]
+                        if COOKIE_FILE:
+                            cli_cmd2 += ['--cookies', COOKIE_FILE]
+                        p2 = subprocess.run(cli_cmd2, capture_output=True, text=True, timeout=20)
+                        if p2.returncode == 0 and p2.stdout:
+                            first_line = p2.stdout.splitlines()[0].strip()
+                            stream_url = first_line
+                else:
+                    log.debug('yt-dlp CLI not found in PATH; cannot fallback')
+            except Exception as e:
+                log.exception('yt-dlp CLI fallback failed: %s', e)
+
         if not stream_url:
             raise RuntimeError('Could not find playable stream URL in yt-dlp info')
 
@@ -1228,6 +1268,17 @@ async def help_cmd(ctx: commands.Context):
         value="`+afk [lý do]` — Bật AFK, vd: `+afk đi ngủ`\n"
               "Tự tắt khi bạn gõ tin nhắn bất kỳ\n"
               "Bot sẽ báo mọi người khi có ai tag bạn lúc AFK",
+        inline=False)
+    embed.add_field(name="🎵 Music (voice)",
+        value=("`+play <link|search>` / `+p` — Phát ngay\n"
+               "`+pause` — Tạm dừng\n"
+               "`+stop` — Dừng và xoá bài đang phát\n"
+               "`+queue <link|search>` — Thêm bài vào queue\n"
+               "`+checkqueue` — Xem danh sách bài đang chờ\n"
+               "`+shuffle` — Xáo trộn danh sách phát\n"
+               "`+repeat` — Lặp lại 1 bài\n"
+               "`+repeat all` — Lặp lại toàn bộ queue\n"
+               "`+playqueue <số>` — Phát bài ở vị trí trong danh sách phảt\n"),
         inline=False)
     embed.set_footer(text=f"Prefix: + | Bot: {bot.user}")
     await ctx.reply(embed=embed)
