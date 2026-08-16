@@ -4,6 +4,7 @@ from discord.ext import commands
 import asyncio, os, logging, json, re, tempfile, shutil, subprocess
 from urllib.parse import urlparse
 from aiohttp import web
+import collections, random
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -138,6 +139,108 @@ class VoiceBot(commands.Bot):
 
 
 bot = VoiceBot()
+
+# ----- Music playback support -------------------------------------------------
+try:
+    import yt_dlp
+except Exception:
+    yt_dlp = None
+
+
+YTDL_OPTS = {
+    'format': 'bestaudio/best',
+    'quiet': True,
+    'no_warnings': True,
+    'ignoreerrors': True,
+    'default_search': 'ytsearch',
+}
+
+
+class YTDLSource:
+    @classmethod
+    async def create_source(cls, search: str):
+        if yt_dlp is None:
+            raise RuntimeError('yt-dlp is not installed')
+        loop = asyncio.get_event_loop()
+        def extract():
+            with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
+                return ydl.extract_info(search, download=False)
+        data = await asyncio.to_thread(extract)
+        if data is None:
+            raise RuntimeError('No data from yt-dlp')
+        if 'entries' in data:
+            # playlist or search result — pick first entry
+            entries = [e for e in data['entries'] if e]
+            if not entries:
+                raise RuntimeError('No entries found')
+            info = entries[0]
+        else:
+            info = data
+        return {
+            'webpage_url': info.get('webpage_url'),
+            'title': info.get('title'),
+            'url': info.get('url') or info.get('webpage_url'),
+            'duration': info.get('duration'),
+        }
+
+
+class MusicPlayer:
+    def __init__(self, guild: discord.Guild):
+        self.guild = guild
+        self.bot = bot
+        self.queue = collections.deque()
+        self.next_event = asyncio.Event()
+        self.play_task = self.bot.loop.create_task(self.player_loop())
+        self.current = None
+        self.loop_one = False
+        self.loop_all = False
+
+    async def player_loop(self):
+        while True:
+            if not self.queue:
+                # wait until a new item is enqueued
+                await asyncio.sleep(0.5)
+                continue
+            src = self.queue.popleft()
+            self.current = src
+            vc = self.guild.voice_client
+            if not vc:
+                # try to reconnect to the owner's voice channel if possible
+                self.current = None
+                continue
+            before_opts = '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
+            options = '-vn -ac 2 -ar 48000 -b:a 192k'
+            audio = discord.FFmpegPCMAudio(src['url'], before_options=before_opts, options=options)
+            play_done = asyncio.Event()
+            def _after(err):
+                if err:
+                    log.error('Player error: %s', err)
+                self.bot.loop.call_soon_threadsafe(play_done.set)
+            try:
+                vc.play(audio, after=_after)
+            except Exception as e:
+                log.exception('Failed to play: %s', e)
+                self.current = None
+                continue
+            await play_done.wait()
+            # handle looping
+            if self.loop_one:
+                # replay same song immediately
+                self.queue.appendleft(src)
+            elif self.loop_all:
+                self.queue.append(src)
+            self.current = None
+
+
+players: dict[int, MusicPlayer] = {}
+
+def get_player(guild: discord.Guild) -> MusicPlayer:
+    pl = players.get(guild.id)
+    if not pl:
+        pl = MusicPlayer(guild)
+        players[guild.id] = pl
+    return pl
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -411,6 +514,133 @@ async def voice_control_cmd(ctx: commands.Context):
         await ctx.message.delete()
     except (discord.Forbidden, discord.NotFound):
         pass
+
+
+# ---------------- Music commands ------------------------------------------------
+@bot.command(name='play', aliases=['p'])
+async def play_cmd(ctx: commands.Context, *, query: str = None):
+    if not query:
+        return await ctx.reply("❌ Dùng: `+play <link or search>`")
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        return await ctx.reply("❌ Bạn cần đang ở trong kênh voice để phát nhạc!")
+    # ensure connected
+    await bot._join_channel(ctx.author.voice.channel)
+    try:
+        src = await YTDLSource.create_source(query)
+    except Exception as e:
+        log.exception("yt-dlp extract failed: %s", e)
+        return await ctx.reply(f"❌ Lỗi khi tìm/nạp track: {e}")
+    player = get_player(ctx.guild)
+    # play immediately: insert to left and stop current to switch
+    player.queue.appendleft({'title': src['title'], 'url': src['url'], 'webpage_url': src['webpage_url'], 'requester': ctx.author.display_name})
+    vc = ctx.guild.voice_client
+    if vc and vc.is_playing():
+        try:
+            vc.stop()
+        except Exception:
+            pass
+    await ctx.send(f"▶️ Đã phát ngay: **{src['title']}**")
+
+
+@bot.command(name='queue')
+async def queue_cmd(ctx: commands.Context, *, query: str = None):
+    if not query:
+        return await ctx.reply("❌ Dùng: `+queue <link or search>`")
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        return await ctx.reply("❌ Bạn cần đang ở trong kênh voice để thêm vào queue!")
+    await bot._join_channel(ctx.author.voice.channel)
+    try:
+        src = await YTDLSource.create_source(query)
+    except Exception as e:
+        log.exception("yt-dlp extract failed: %s", e)
+        return await ctx.reply(f"❌ Lỗi khi thêm vào queue: {e}")
+    player = get_player(ctx.guild)
+    player.queue.append({'title': src['title'], 'url': src['url'], 'webpage_url': src['webpage_url'], 'requester': ctx.author.display_name})
+    await ctx.send(f"➕ Đã thêm vào queue: **{src['title']}**")
+
+
+@bot.command(name='checkqueue')
+async def checkqueue_cmd(ctx: commands.Context):
+    player = get_player(ctx.guild)
+    if not player.queue and not player.current:
+        return await ctx.reply("📭 Queue hiện đang trống")
+    lines = []
+    if player.current:
+        lines.append(f"Now playing: **{player.current['title']}**")
+    for i, item in enumerate(list(player.queue), start=1):
+        lines.append(f"{i}. {item['title']} (by {item.get('requester','-')})")
+    msg = "\n".join(lines)
+    if len(msg) > 1900:
+        msg = msg[:1900] + "..."
+    await ctx.reply(msg)
+
+
+@bot.command(name='pause')
+async def pause_cmd(ctx: commands.Context):
+    vc = ctx.guild.voice_client
+    if not vc or not vc.is_playing():
+        return await ctx.reply("❌ Không có nhạc đang phát")
+    try:
+        vc.pause()
+        await ctx.reply("⏸️ Đã tạm dừng")
+    except Exception as e:
+        await ctx.reply(f"❌ Lỗi khi pause: {e}")
+
+
+@bot.command(name='stop')
+async def stop_cmd(ctx: commands.Context):
+    vc = ctx.guild.voice_client
+    player = get_player(ctx.guild)
+    player.queue.clear()
+    try:
+        if vc:
+            vc.stop()
+            await ctx.reply("⏹️ Đã dừng và xoá queue")
+        else:
+            await ctx.reply("❌ Bot không có kết nối voice")
+    except Exception as e:
+        await ctx.reply(f"❌ Lỗi khi stop: {e}")
+
+
+@bot.command(name='shuffle')
+async def shuffle_cmd(ctx: commands.Context):
+    player = get_player(ctx.guild)
+    q = list(player.queue)
+    random.shuffle(q)
+    player.queue = collections.deque(q)
+    await ctx.reply("🔀 Đã xáo trộn queue")
+
+
+@bot.command(name='repeat')
+async def repeat_cmd(ctx: commands.Context, *, mode: str = None):
+    player = get_player(ctx.guild)
+    if mode and mode.lower() in ('all','all'):
+        player.loop_all = not player.loop_all
+        await ctx.reply(f"🔁 Loop all: {'ON' if player.loop_all else 'OFF'}")
+        return
+    player.loop_one = not player.loop_one
+    await ctx.reply(f"🔂 Loop single: {'ON' if player.loop_one else 'OFF'}")
+
+
+@bot.command(name='playqueue')
+async def playqueue_cmd(ctx: commands.Context, index: int = None):
+    if index is None:
+        return await ctx.reply("❌ Dùng: `+playqueue <số thứ tự>`")
+    player = get_player(ctx.guild)
+    if index < 1 or index > len(player.queue):
+        return await ctx.reply("❌ Chỉ số ngoài phạm vi queue")
+    # pop element at index (1-based) and play it next
+    item = player.queue[index-1]
+    # remove that item
+    del player.queue[index-1]
+    player.queue.appendleft(item)
+    vc = ctx.guild.voice_client
+    if vc and vc.is_playing():
+        try:
+            vc.stop()
+        except Exception:
+            pass
+    await ctx.reply(f"▶️ Đã chuyển và phát: **{item['title']}**")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
