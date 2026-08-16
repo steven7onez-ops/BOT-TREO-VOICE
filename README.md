@@ -102,6 +102,7 @@ Xong! Giờ ai join vào kênh "➕ Tạo kênh thoại" sẽ tự có kênh ri�
 | `TIKBOT_AUTO_DOMAINS` | ⬜ | Space-separated domains để bot tự phát hiện link (mặc định: `youtube tiktok instagram reddit redd.it`) |
 | `TIKBOT_SILENT_DOMAINS` | ⬜ | Domain nào bot im lặng (space-separated) |
 | `TIKBOT_MAX_UPLOAD_MB` | ⬜ | Kích thước tối đa (MB) bot sẽ gửi trực tiếp; mặc định `8`. Bot sẽ cố nén bằng `ffmpeg` nếu lớn hơn |
+| `TIKBOT_MAX_UPLOAD_MB` | ⬜ | Kích thước tối đa (MB) bot sẽ gửi trực tiếp; mặc định `50`. Bot sẽ cố nén bằng `ffmpeg` nếu lớn hơn |
 
 ### Yêu cầu hệ thống
 - `ffmpeg` phải có trong PATH nếu chạy local (Dockerfile đã cài trong container)
@@ -129,6 +130,22 @@ python bot.py
 - Repo đã có `Dockerfile` (cài `ffmpeg` + Python deps). Push lên GitHub và kết nối repo với Railway; Railway sẽ build Docker image tự động.
 - Trên Railway (hoặc môi trường deploy khác) set các Variables tương ứng (DISCORD_TOKEN, GUILD_ID, DASHBOARD_KEY, v.v.).
 
+### Đẩy code lên GitHub (nhanh)
+1. Khởi tạo git trong thư mục (nếu chưa):
+```bash
+git init
+git add .
+git commit -m "Initial bot commit"
+git branch -M main
+git remote add origin https://github.com/<your-username>/<your-repo>.git
+git push -u origin main
+```
+2. (Tuỳ chọn) Thêm secrets trên GitHub (Settings → Secrets) nếu bạn muốn GH Actions push Docker image:
+	- `DOCKERHUB_USERNAME`
+	- `DOCKERHUB_TOKEN`
+	- Thêm `DOCKERHUB_REPOSITORY` dưới `Repository > Settings > Environments` hoặc qua `Actions` env.
+
+Sau khi push, GitHub Actions `CI` sẽ chạy: kiểm tra syntax, cài dependencies và (nếu cấu hình) build/push image.
 ---
 
 ## 🔑 Quyền bot cần thêm
