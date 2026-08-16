@@ -96,6 +96,39 @@ Xong! Giờ ai join vào kênh "➕ Tạo kênh thoại" sẽ tự có kênh ri�
 | `DASHBOARD_KEY` | ✅ | Mật khẩu dashboard web |
 | `PORT` | ⬜ | Port dashboard (Railway tự set) |
 
+### Biến bổ sung cho TikBot-style upload
+| `TIKBOT_STATUS_TEXT` | ⬜ | Text hiển thị trong presence (mặc định: "🎙️ voice channel") |
+| `TIKBOT_VERSION` | ⬜ | Phiên bản để hiển thị trong presence (ví dụ: `1.0.0`) |
+| `TIKBOT_AUTO_DOMAINS` | ⬜ | Space-separated domains để bot tự phát hiện link (mặc định: `youtube tiktok instagram reddit redd.it`) |
+| `TIKBOT_SILENT_DOMAINS` | ⬜ | Domain nào bot im lặng (space-separated) |
+| `TIKBOT_MAX_UPLOAD_MB` | ⬜ | Kích thước tối đa (MB) bot sẽ gửi trực tiếp; mặc định `8`. Bot sẽ cố nén bằng `ffmpeg` nếu lớn hơn |
+
+### Yêu cầu hệ thống
+- `ffmpeg` phải có trong PATH nếu chạy local (Dockerfile đã cài trong container)
+- `yt-dlp` được liệt kê trong `requirements.txt` và sẽ được cài khi chạy `pip install -r requirements.txt`
+
+### Chạy local (Linux / macOS / Windows WSL)
+1. Cài Python 3.11+ hoặc 3.13 và `ffmpeg`.
+2. Cài dependencies:
+```bash
+pip install -r requirements.txt
+```
+3. Thiết lập biến môi trường (ví dụ Linux/macOS):
+```bash
+export DISCORD_TOKEN="your-token"
+export GUILD_ID="123456789012345678"
+export DASHBOARD_KEY="changeme"
+export TIKBOT_MAX_UPLOAD_MB=50
+```
+4. Chạy bot:
+```bash
+python bot.py
+```
+
+### Triển khai nhanh (Railway / Docker)
+- Repo đã có `Dockerfile` (cài `ffmpeg` + Python deps). Push lên GitHub và kết nối repo với Railway; Railway sẽ build Docker image tự động.
+- Trên Railway (hoặc môi trường deploy khác) set các Variables tương ứng (DISCORD_TOKEN, GUILD_ID, DASHBOARD_KEY, v.v.).
+
 ---
 
 ## 🔑 Quyền bot cần thêm

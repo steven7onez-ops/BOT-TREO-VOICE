@@ -1,7 +1,8 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
-import asyncio, os, logging, json
+import asyncio, os, logging, json, re, tempfile, shutil, subprocess
+from urllib.parse import urlparse
 from aiohttp import web
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,15 @@ TARGET_CHANNEL = int(os.environ.get("VOICE_CHANNEL_ID", "0"))
 DASHBOARD_PORT = int(os.environ.get("PORT", "8080"))
 DASHBOARD_KEY  = os.environ.get("DASHBOARD_KEY", "changeme")
 OWNER_ID       = int(os.environ.get("OWNER_ID", "852834067044630558"))
+
+# TikBot-like extras
+TIKBOT_STATUS_TEXT = os.environ.get("TIKBOT_STATUS_TEXT", "🎙️ voice channel")
+TIKBOT_VERSION = os.environ.get("TIKBOT_VERSION", "")
+# space-separated list of domains to auto-detect in messages
+TIKBOT_AUTO_DOMAINS = os.environ.get("TIKBOT_AUTO_DOMAINS", "youtube tiktok instagram reddit redd.it").split()
+# domains for which the bot should be silent (don't post detection messages)
+TIKBOT_SILENT_DOMAINS = os.environ.get("TIKBOT_SILENT_DOMAINS", "").split()
+TIKBOT_MAX_UPLOAD_MB = int(os.environ.get("TIKBOT_MAX_UPLOAD_MB", "50"))
 
 PROFILE_DB_FILE = Path("/tmp/profiles.json")
 VC_STATE_FILE   = Path("/tmp/vc_state.json") # kênh nào đang có panel mở + message id
@@ -64,7 +74,11 @@ class VoiceBot(commands.Bot):
     async def on_ready(self):
         log.info(f"✅ Đã đăng nhập: {self.user} (ID: {self.user.id})")
         log.info(f"📡 Đang phục vụ {len(self.guilds)} server")
-        await self.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="🎙️ voice channel"))
+        # Presence: include optional version/status text (TikBot-style)
+        status_text = TIKBOT_STATUS_TEXT
+        if TIKBOT_VERSION:
+            status_text = f"{status_text} | v{TIKBOT_VERSION}"
+        await self.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name=status_text))
         if self.permanent_channel_id:
             await self._join_by_id(self.permanent_channel_id, label="kênh vĩnh viễn")
 
@@ -474,6 +488,29 @@ async def on_message(message: discord.Message):
             )
             await message.channel.send(embed=embed, delete_after=10)
 
+    # Auto-link detection (TikBot-style): detect configured domains and post a short notice
+    try:
+        urls = re.findall(r'https?://\S+', content)
+        if urls:
+            sent = False
+            for u in urls:
+                netloc = urlparse(u).netloc.lower()
+                for dom in TIKBOT_AUTO_DOMAINS:
+                    if not dom: continue
+                    if dom in netloc:
+                        if dom in TIKBOT_SILENT_DOMAINS:
+                            sent = True
+                            break
+                        try:
+                            await message.channel.send(f"🔗 Detected {dom} link: {u}")
+                        except Exception:
+                            pass
+                        sent = True
+                        break
+                if sent: break
+    except Exception:
+        pass
+
     # Voice Manager: repost panel khi có tin nhắn mới trong kênh voice
     if isinstance(message.channel, discord.VoiceChannel) and voice_manager.is_managed_channel(message.channel.id):
         if not (content.startswith("+voice_control") or content.startswith("+vc") or content.startswith("+voicecontrol")):
@@ -656,6 +693,120 @@ async def ping(ctx: commands.Context):
     embed.add_field(name="🎙️ Voice", value=voice_ch, inline=False)
     embed.set_footer(text=f"Bot: {bot.user}", icon_url=bot.user.display_avatar.url)
     await ctx.reply(embed=embed)
+
+
+@bot.command(name="tiktok")
+async def tiktok_cmd(ctx: commands.Context, url: str = ""):
+    """+tiktok <link> — cố gắng tải video bằng yt-dlp nếu có, hoặc hướng dẫn cài đặt."""
+    if not url or not url.startswith("http"):
+        return await ctx.reply("❌ Vui lòng cung cấp link video, vd: `+tiktok https://www.tiktok.com/...`")
+    netloc = urlparse(url).netloc.lower()
+    if not any(dom in netloc for dom in TIKBOT_AUTO_DOMAINS):
+        # vẫn cho phép nhưng cảnh báo
+        await ctx.reply("⚠️ Link không thuộc domain cấu hình auto-domains. Bot sẽ cố tải nhưng có thể thất bại.")
+
+    try:
+        import yt_dlp
+    except Exception:
+        return await ctx.reply("❌ Module `yt-dlp` chưa được cài. Cài bằng `pip install yt-dlp` và khởi động lại bot.")
+
+    status_msg = await ctx.reply("⏳ Đang tải video, xin chờ... (có thể mất vài chục giây)")
+
+    def dl_work(u: str):
+        tmpdir = tempfile.mkdtemp(prefix="tikdl_")
+        ydl_opts = {
+            'outtmpl': os.path.join(tmpdir, '%(id)s.%(ext)s'),
+            'format': 'bestvideo+bestaudio/best',
+            'noplaylist': True,
+            'merge_output_format': 'mp4',
+        }
+        ydl = yt_dlp.YoutubeDL(ydl_opts)
+        info = ydl.extract_info(u, download=True)
+        # prepare filename
+        try:
+            fname = ydl.prepare_filename(info)
+        except Exception:
+            # fallback: find any file in tmpdir
+            files = os.listdir(tmpdir)
+            if files:
+                fname = os.path.join(tmpdir, files[0])
+            else:
+                fname = None
+        return tmpdir, fname
+
+    try:
+        tmpdir, filepath = await asyncio.to_thread(dl_work, url)
+    except Exception as e:
+        await status_msg.edit(content=f"❌ Lỗi khi tải: {e}")
+        return
+
+    if not filepath or not os.path.exists(filepath):
+        await status_msg.edit(content="❌ Không tìm thấy file sau khi tải.")
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return
+
+    # check size (configurable via TIKBOT_MAX_UPLOAD_MB)
+    size = os.path.getsize(filepath)
+    max_bytes = TIKBOT_MAX_UPLOAD_MB * 1024 * 1024
+    # helper: re-encode with ffmpeg to try to fit target size
+    def reencode_to_target(inpath: str, outpath: str, duration: float, target_bytes: int) -> bool:
+        # audio kbps we allocate
+        audio_kbps = 96
+        if duration and duration > 0:
+            target_bps = (target_bytes * 8) / duration
+            video_bps = max(32_000, int(target_bps - audio_kbps * 1000))
+        else:
+            video_bps = 300_000  # 300 kbps default
+        video_k = max(64, video_bps // 1000)
+        # ffmpeg command
+        cmd = [
+            'ffmpeg', '-y', '-i', inpath,
+            '-c:v', 'libx264', '-preset', 'veryfast',
+            '-b:v', f'{video_k}k', '-maxrate', f'{video_k}k', '-bufsize', f'{video_k*2}k',
+            '-c:a', 'aac', '-b:a', f'{audio_kbps}k',
+            '-movflags', '+faststart', outpath
+        ]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return os.path.exists(outpath)
+        except Exception:
+            return False
+    if size <= max_bytes:
+        try:
+            await status_msg.edit(content="✅ Tải xong, gửi file...")
+            await ctx.reply(file=discord.File(filepath))
+            await status_msg.delete()
+        except Exception as e:
+            await status_msg.edit(content=f"❌ Lỗi khi gửi file: {e}")
+    else:
+        # Attempt to re-encode to fit max_bytes
+        duration = None
+        try:
+            import yt_dlp
+            info_duration = None
+            # try to read duration from downloaded info file if available
+            # (yt_dlp returns info earlier; we didn't capture it here reliably), so fallback None
+        except Exception:
+            info_duration = None
+
+        outpath = os.path.splitext(filepath)[0] + "_small.mp4"
+        reok = await asyncio.to_thread(reencode_to_target, filepath, outpath, info_duration or 0, max_bytes)
+        if reok and os.path.exists(outpath) and os.path.getsize(outpath) <= max_bytes:
+            try:
+                await status_msg.edit(content="✅ Đã nén và gửi file...")
+                await ctx.reply(file=discord.File(outpath))
+                await status_msg.delete()
+            except Exception as e:
+                await status_msg.edit(content=f"❌ Lỗi khi gửi file đã nén: {e}")
+        else:
+            await status_msg.edit(content=f"⚠️ File quá lớn ({size//1024//1024} MB). Không thể gửi. File tạm: {filepath}")
+
+    # cleanup tmpdir after a short delay
+    try:
+        await asyncio.sleep(2)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    except Exception:
+        pass
 
 @bot.command(name="help", aliases=["h"])
 async def help_cmd(ctx: commands.Context):
