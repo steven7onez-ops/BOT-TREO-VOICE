@@ -101,7 +101,6 @@ Xong! Giờ ai join vào kênh "➕ Tạo kênh thoại" sẽ tự có kênh ri�
 | `TIKBOT_VERSION` | ⬜ | Phiên bản để hiển thị trong presence (ví dụ: `1.0.0`) |
 | `TIKBOT_AUTO_DOMAINS` | ⬜ | Space-separated domains để bot tự phát hiện link (mặc định: `youtube tiktok instagram reddit redd.it`) |
 | `TIKBOT_SILENT_DOMAINS` | ⬜ | Domain nào bot im lặng (space-separated) |
-| `TIKBOT_MAX_UPLOAD_MB` | ⬜ | Kích thước tối đa (MB) bot sẽ gửi trực tiếp; mặc định `8`. Bot sẽ cố nén bằng `ffmpeg` nếu lớn hơn |
 | `TIKBOT_MAX_UPLOAD_MB` | ⬜ | Kích thước tối đa (MB) bot sẽ gửi trực tiếp; mặc định `50`. Bot sẽ cố nén bằng `ffmpeg` nếu lớn hơn |
 
 ### Yêu cầu hệ thống
@@ -125,6 +124,28 @@ export TIKBOT_MAX_UPLOAD_MB=50
 ```bash
 python bot.py
 ```
+
+### YouTube cookies (khi yt-dlp báo "Sign in to confirm you're not a bot")
+
+Một số video YouTube yêu cầu cookie (ví dụ video age-restricted, region-restricted hoặc khi YouTube bật kiểm tra bot). Nếu bạn thấy lỗi như "Sign in to confirm you're not a bot" hoặc hướng dẫn dùng `--cookies-from-browser`, thực hiện một trong các cách sau:
+
+- Xuất cookies từ trình duyệt thành file `cookies.txt` bằng extension `cookies.txt` hoặc `EditThisCookie`.
+- Đặt cookie cho bot bằng một trong 2 cách:
+	- Upload file `cookies.txt` vào container và set biến môi trường `YTDL_COOKIE_FILE` trỏ tới đường dẫn file trong container (ví dụ `/app/cookies.txt`).
+	- Hoặc base64-encode nội dung `cookies.txt` rồi set vào biến môi trường `YTDL_COOKIES_BASE64` (an toàn hơn để lưu dưới dạng secret). Bot sẽ giải mã và ghi tạm file cookies khi cần.
+
+Ví dụ mã hóa file trên Linux/macOS:
+```bash
+base64 cookies.txt | tr -d '\n'  # copy kết quả đặt vào YTDL_COOKIES_BASE64
+```
+Ví dụ trên Windows PowerShell:
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes('cookies.txt'))
+```
+
+Sau đó trong Railway/GitHub Actions/ENV thêm biến `YTDL_COOKIES_BASE64` (secret) với giá trị base64 thu được, hoặc upload `cookies.txt` và set `YTDL_COOKIE_FILE`.
+
+Lưu ý: Cookies có thể hết hạn; nếu lỗi quay lại, xuất cookies mới và cập nhật secret.
 
 ### Triển khai nhanh (Railway / Docker)
 - Repo đã có `Dockerfile` (cài `ffmpeg` + Python deps). Push lên GitHub và kết nối repo với Railway; Railway sẽ build Docker image tự động.

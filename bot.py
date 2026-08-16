@@ -147,6 +147,9 @@ except Exception:
     yt_dlp = None
 
 
+import base64
+
+# Build yt-dlp options and support cookie injection via env vars
 YTDL_OPTS = {
     'format': 'bestaudio/best',
     'quiet': True,
@@ -154,6 +157,28 @@ YTDL_OPTS = {
     'ignoreerrors': True,
     'default_search': 'ytsearch',
 }
+
+# Cookie support: either provide a file path in YTDL_COOKIE_FILE, raw cookies in
+# YTDL_COOKIES, or base64-encoded cookies in YTDL_COOKIES_BASE64. If provided,
+# we write cookies to a temp file and pass it to yt-dlp via 'cookiefile'.
+COOKIE_FILE = os.environ.get('YTDL_COOKIE_FILE')
+cookie_raw = os.environ.get('YTDL_COOKIES')
+cookie_b64 = os.environ.get('YTDL_COOKIES_BASE64')
+if not COOKIE_FILE and (cookie_raw or cookie_b64):
+    try:
+        tmp_cf = Path(tempfile.mkdtemp(prefix='ytdl_cookies_')) / 'cookies.txt'
+        if cookie_b64:
+            data = base64.b64decode(cookie_b64)
+            tmp_cf.write_bytes(data)
+        else:
+            tmp_cf.write_text(cookie_raw)
+        COOKIE_FILE = str(tmp_cf)
+        log.info('Using yt-dlp cookies from env, written to %s', COOKIE_FILE)
+    except Exception as e:
+        log.exception('Failed to write yt-dlp cookie file: %s', e)
+
+if COOKIE_FILE:
+    YTDL_OPTS['cookiefile'] = COOKIE_FILE
 
 
 class YTDLSource:
@@ -165,7 +190,16 @@ class YTDLSource:
         def extract():
             with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
                 return ydl.extract_info(search, download=False)
-        data = await asyncio.to_thread(extract)
+        try:
+            data = await asyncio.to_thread(extract)
+        except Exception as exc:
+            s = str(exc)
+            if 'Sign in to confirm' in s or 'cookies' in s.lower():
+                raise RuntimeError(
+                    'YouTube requires cookies to access this video.\n'
+                    'Provide cookies via env `YTDL_COOKIE_FILE` (path) or `YTDL_COOKIES_BASE64` (base64-encoded cookies.txt).'
+                )
+            raise RuntimeError(f'yt-dlp error: {s}')
         if data is None:
             raise RuntimeError('No data from yt-dlp')
         if 'entries' in data:
