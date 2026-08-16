@@ -740,7 +740,8 @@ async def tiktok_cmd(ctx: commands.Context, url: str = ""):
     try:
         import yt_dlp
     except Exception:
-        return await ctx.reply("❌ Module `yt-dlp` chưa được cài. Cài bằng `pip install yt-dlp` và khởi động lại bot.")
+        # try fallback: run pip install git+https... (non-blocking suggestion)
+        return await ctx.reply("❌ Module `yt-dlp` chưa được cài. Hãy cập nhật yt-dlp bằng `pip install -U git+https://github.com/yt-dlp/yt-dlp.git` hoặc rebuild Docker image.")
 
     # --- Permission checks: make sure bot can send messages; if it can't, DM the invoker and abort
     guild_member = ctx.guild.me if ctx.guild else None
@@ -787,8 +788,24 @@ async def tiktok_cmd(ctx: commands.Context, url: str = ""):
     try:
         tmpdir, filepath = await asyncio.to_thread(dl_work, url)
     except Exception as e:
-        await status_msg.edit(content=f"❌ Lỗi khi tải: {e}")
-        return
+        log.exception("Lỗi yt-dlp extract: %s", e)
+        # attempt fallback: try calling yt-dlp CLI to get more robust behaviour
+        try:
+            fallback_tmp = tempfile.mkdtemp(prefix="tikdlcli_")
+            cli_out = os.path.join(fallback_tmp, 'out.%(ext)s')
+            cmd = ["yt-dlp", "-o", cli_out, url]
+            subprocess.run(cmd, check=True)
+            files = os.listdir(fallback_tmp)
+            if files:
+                filepath = os.path.join(fallback_tmp, files[0])
+                tmpdir = fallback_tmp
+            else:
+                raise RuntimeError("CLI yt-dlp didn't produce a file")
+        except Exception as e2:
+            log.exception("Fallback yt-dlp CLI failed: %s", e2)
+            await status_msg.edit(content=f"❌ Lỗi khi tải (yt-dlp): {e}\nHãy cập nhật yt-dlp: `pip install -U git+https://github.com/yt-dlp/yt-dlp.git` và thử lại.`")
+            return
+        
 
     if not filepath or not os.path.exists(filepath):
         await status_msg.edit(content="❌ Không tìm thấy file sau khi tải.")
