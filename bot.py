@@ -363,7 +363,11 @@ class VoiceManagerImpl:
 
         embed = build_panel_embed(channel)
         view = VoicePanelView(channel.id)
-        msg = await channel.send(embed=embed, view=view)
+        try:
+            msg = await channel.send(embed=embed, view=view)
+        except discord.Forbidden:
+            log.warning(f"❌ Thiếu quyền gửi tin nhắn vào kênh chat của voice #{channel.name} (ID: {channel.id})")
+            return
         state_all[key] = {"panel_message_id": msg.id}
         save_vc_state(state_all)
         log.info(f"📋 Đã mở panel cho #{channel.name}")
@@ -470,7 +474,10 @@ async def on_message(message: discord.Message):
             description=f"✅ **{message.author.display_name}** đã trở lại sau **{duration}** AFK!",
             color=0x3ba55d
         )
-        await message.channel.send(embed=embed, delete_after=8)
+        try:
+            await message.channel.send(embed=embed, delete_after=8)
+        except discord.Forbidden:
+            log.warning(f"Không thể gửi thông báo AFK trở lại ở kênh {message.channel.id} — thiếu quyền")
 
     # Ai đó tag người đang AFK
     for mentioned in message.mentions:
@@ -486,7 +493,10 @@ async def on_message(message: discord.Message):
                 ),
                 color=0x9090a8
             )
-            await message.channel.send(embed=embed, delete_after=10)
+            try:
+                await message.channel.send(embed=embed, delete_after=10)
+            except discord.Forbidden:
+                log.warning(f"Không thể gửi thông báo AFK mention ở kênh {message.channel.id} — thiếu quyền")
 
     # Auto-link detection (TikBot-style): detect configured domains and post a short notice
     try:
@@ -514,9 +524,29 @@ async def on_message(message: discord.Message):
     # Voice Manager: repost panel khi có tin nhắn mới trong kênh voice
     if isinstance(message.channel, discord.VoiceChannel) and voice_manager.is_managed_channel(message.channel.id):
         if not (content.startswith("+voice_control") or content.startswith("+vc") or content.startswith("+voicecontrol")):
-            await voice_manager.repost_panel(message.channel)
+            try:
+                await voice_manager.repost_panel(message.channel)
+            except discord.Forbidden:
+                log.warning(f"Không thể repost panel trong kênh {message.channel.id} — thiếu quyền")
 
     await bot.process_commands(message)
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error):
+    # Handle missing permissions (Forbidden) gracefully — DM the invoker and log
+    orig = getattr(error, 'original', error)
+    if isinstance(orig, discord.Forbidden):
+        try:
+            await ctx.author.send(
+                "⚠️ Bot thiếu quyền thực hiện hành động này trên server. "
+                "Vui lòng cấp quyền `Send Messages`, `Embed Links`, `Attach Files`, `Manage Messages` hoặc liên hệ admin.")
+        except Exception:
+            log.warning("Không thể DM người dùng để thông báo lỗi quyền.")
+        log.exception("Command failed due to missing permissions")
+        return
+    # Fall back to default handling for other errors (log)
+    log.exception("Unhandled command error: %s", error)
 
 
 def is_admin():
@@ -702,15 +732,35 @@ async def tiktok_cmd(ctx: commands.Context, url: str = ""):
         return await ctx.reply("❌ Vui lòng cung cấp link video, vd: `+tiktok https://www.tiktok.com/...`")
     netloc = urlparse(url).netloc.lower()
     if not any(dom in netloc for dom in TIKBOT_AUTO_DOMAINS):
-        # vẫn cho phép nhưng cảnh báo
-        await ctx.reply("⚠️ Link không thuộc domain cấu hình auto-domains. Bot sẽ cố tải nhưng có thể thất bại.")
+        # vẫn cho phép nhưng cảnh báo (cảnh báo sẽ được gửi sau khi kiểm tra quyền)
+        warn_non_auto = True
+    else:
+        warn_non_auto = False
 
     try:
         import yt_dlp
     except Exception:
         return await ctx.reply("❌ Module `yt-dlp` chưa được cài. Cài bằng `pip install yt-dlp` và khởi động lại bot.")
 
+    # --- Permission checks: make sure bot can send messages; if it can't, DM the invoker and abort
+    guild_member = ctx.guild.me if ctx.guild else None
+    perms = ctx.channel.permissions_for(guild_member) if guild_member else None
+    can_send = True if perms is None else perms.send_messages
+    can_attach = True if perms is None else perms.attach_files
+    if not can_send:
+        try:
+            await ctx.author.send(f"⚠️ Bot hiện không có quyền `Send Messages` trong kênh {ctx.channel.name} (ID: {ctx.channel.id}). Vui lòng cấp quyền để dùng `+tiktok` ở kênh này.")
+        except Exception:
+            log.warning("Không thể DM user để thông báo thiếu quyền send_messages")
+        return
+
+    # send initial status message in channel (we know can_send==True)
     status_msg = await ctx.reply("⏳ Đang tải video, xin chờ... (có thể mất vài chục giây)")
+    if warn_non_auto:
+        try:
+            await status_msg.edit(content="⚠️ Link không thuộc domain cấu hình auto-domains. Bot sẽ cố tải nhưng có thể thất bại.\n" + status_msg.content)
+        except Exception:
+            pass
 
     def dl_work(u: str):
         tmpdir = tempfile.mkdtemp(prefix="tikdl_")
@@ -774,8 +824,25 @@ async def tiktok_cmd(ctx: commands.Context, url: str = ""):
     if size <= max_bytes:
         try:
             await status_msg.edit(content="✅ Tải xong, gửi file...")
-            await ctx.reply(file=discord.File(filepath))
-            await status_msg.delete()
+            # prefer sending in channel if bot can attach; otherwise DM the user
+            if can_attach:
+                try:
+                    await ctx.reply(file=discord.File(filepath))
+                    await status_msg.delete()
+                except discord.Forbidden:
+                    # fallback to DM
+                    try:
+                        await ctx.author.send("📩 Bot không có quyền đính kèm file trong kênh; gửi file qua DM:", file=discord.File(filepath))
+                        await status_msg.delete()
+                    except Exception as e:
+                        await status_msg.edit(content=f"❌ Lỗi khi gửi file qua DM: {e}")
+            else:
+                # cannot attach in channel — send via DM
+                try:
+                    await ctx.author.send("📩 Bot không có quyền đính kèm file trong kênh; gửi file qua DM:", file=discord.File(filepath))
+                    await status_msg.delete()
+                except Exception as e:
+                    await status_msg.edit(content=f"❌ Bot không thể gửi file ở kênh này và không thể DM: {e}")
         except Exception as e:
             await status_msg.edit(content=f"❌ Lỗi khi gửi file: {e}")
     else:
@@ -794,8 +861,22 @@ async def tiktok_cmd(ctx: commands.Context, url: str = ""):
         if reok and os.path.exists(outpath) and os.path.getsize(outpath) <= max_bytes:
             try:
                 await status_msg.edit(content="✅ Đã nén và gửi file...")
-                await ctx.reply(file=discord.File(outpath))
-                await status_msg.delete()
+                if can_attach:
+                    try:
+                        await ctx.reply(file=discord.File(outpath))
+                        await status_msg.delete()
+                    except discord.Forbidden:
+                        try:
+                            await ctx.author.send("📩 Bot không có quyền đính kèm file trong kênh; gửi file qua DM:", file=discord.File(outpath))
+                            await status_msg.delete()
+                        except Exception as e:
+                            await status_msg.edit(content=f"❌ Lỗi khi gửi file đã nén qua DM: {e}")
+                else:
+                    try:
+                        await ctx.author.send("📩 Bot không có quyền đính kèm file trong kênh; gửi file qua DM:", file=discord.File(outpath))
+                        await status_msg.delete()
+                    except Exception as e:
+                        await status_msg.edit(content=f"❌ Bot không thể gửi file đã nén ở kênh này và không thể DM: {e}")
             except Exception as e:
                 await status_msg.edit(content=f"❌ Lỗi khi gửi file đã nén: {e}")
         else:
