@@ -155,6 +155,9 @@ YTDL_OPTS = {
     'no_warnings': True,
     'ignoreerrors': True,
     'default_search': 'ytsearch',
+    'http_headers': {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    },
 }
 
 # Cookie support: either provide a file path in YTDL_COOKIE_FILE, raw cookies in
@@ -178,6 +181,12 @@ if not COOKIE_FILE and (cookie_raw or cookie_b64):
 
 if COOKIE_FILE:
     YTDL_OPTS['cookiefile'] = COOKIE_FILE
+
+# Proxy support: if HTTP_PROXY env var is set, use it
+HTTP_PROXY = os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy')
+if HTTP_PROXY:
+    YTDL_OPTS['proxy'] = HTTP_PROXY
+    log.info('Using HTTP proxy: %s', HTTP_PROXY)
 
 
 class YTDLSource:
