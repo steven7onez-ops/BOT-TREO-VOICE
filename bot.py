@@ -202,6 +202,7 @@ class YTDLSource:
         # Retry logic for rate-limit errors (YouTube rate-limits for up to 1 hour!)
         max_retries = 3
         retry_delays = [30, 120, 300]  # exponential backoff: 30s, 2min, 5min
+        data = None  # Initialize data before loop
         last_error = None
         
         for attempt in range(max_retries):
@@ -211,7 +212,9 @@ class YTDLSource:
 
             try:
                 data = await asyncio.to_thread(extract)
+                log.info(f"✅ Successfully extracted: {search}")
                 break  # success, exit retry loop
+                
             except Exception as exc:
                 s = str(exc)
                 last_error = s
@@ -219,42 +222,58 @@ class YTDLSource:
                 # Check if rate-limited
                 is_rate_limited = 'rate-limited' in s.lower() or 'try again later' in s.lower() or 'HTTP Error 429' in s
                 
+                # If rate-limited and not last attempt, retry with exponential backoff
                 if is_rate_limited and attempt < max_retries - 1:
                     delay = retry_delays[attempt]
                     delay_min = delay // 60
-                    log.warning(f"⚠️  Rate-limited by YouTube, retry {attempt+1}/{max_retries-1} after {delay_min}m {delay%60}s... (💡 Use YouTube cookies to bypass!)")
+                    delay_sec = delay % 60
+                    log.warning(f"⏳ Rate-limited by YouTube! Retry {attempt+1}/{max_retries-1} after {delay_min}m {delay_sec}s... (💡 Setup YouTube cookies to bypass!)")
                     await asyncio.sleep(delay)
-                    continue
+                    data = None  # Reset for next attempt
+                    continue  # Jump to next retry
                 
-                # if format not available, retry without forcing format
-                if 'Requested format is not available' in s:
+                # If not rate-limited, try format fallback
+                if 'Requested format is not available' in s and not is_rate_limited:
                     try:
+                        log.info("📝 Format not available, trying fallback...")
                         alt_opts = dict(YTDL_OPTS)
                         alt_opts.pop('format', None)
                         def extract_alt():
                             with yt_dlp.YoutubeDL(alt_opts) as ydl:
                                 return ydl.extract_info(search, download=False)
                         data = await asyncio.to_thread(extract_alt)
+                        log.info(f"✅ Fallback successful: {search}")
                         break
-                    except Exception:
+                    except Exception as e:
+                        log.warning(f"Format fallback failed: {e}")
                         data = None
+                else:
+                    data = None
                 
+                # If we got here, extraction failed (either after all retries or non-retryable error)
                 if data is None:
                     if 'Sign in to confirm' in s or 'cookies' in s.lower():
                         raise RuntimeError(
-                            'YouTube requires cookies to access this video.\n'
-                            'Provide cookies via env `YTDL_COOKIE_FILE` (path) or `YTDL_COOKIES_BASE64` (base64-encoded cookies.txt).'
+                            '🔐 YouTube requires cookies to access this video.\n'
+                            'Fix: Set env var YTDL_COOKIES_BASE64 with YouTube cookies.\n'
+                            'Read: SETUP_YOUTUBE_COOKIES.md for instructions.'
                         )
                     if is_rate_limited:
                         raise RuntimeError(
-                            '⏳ YouTube rate-limited the session.\n'
-                            'Wait a few minutes and try again, or provide YouTube cookies to bypass limits.\n'
-                            f'Error: {s}'
+                            '⏳ YouTube rate-limited the session (wait time: up to 1 hour).\n'
+                            'Options:\n'
+                            '  1. Wait a few minutes and try again\n'
+                            '  2. Setup YouTube cookies (RECOMMENDED): SETUP_YOUTUBE_COOKIES.md\n'
+                            f'Error details: {s}'
                         )
-                    raise RuntimeError(f'yt-dlp error: {s}')
+                    raise RuntimeError(f'❌ yt-dlp error: {s}')
         
+        # Final check after all retries
         if data is None:
-            raise RuntimeError('No data from yt-dlp')
+            raise RuntimeError(
+                '❌ Failed to extract video after all retries.\n'
+                'If rate-limited, setup YouTube cookies to bypass: SETUP_YOUTUBE_COOKIES.md'
+            )
         
         log.debug('yt-dlp returned data keys: %s', list(data.keys()) if isinstance(data, dict) else None)
         if 'entries' in data:
