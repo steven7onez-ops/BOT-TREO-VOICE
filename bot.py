@@ -158,6 +158,9 @@ YTDL_OPTS = {
     'http_headers': {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
     },
+    'socket_timeout': 30,
+    'sleep_interval': 2,  # 2 giây delay giữa request để tránh rate-limit
+    'max_sleep_interval': 10,
 }
 
 # Cookie support: either provide a file path in YTDL_COOKIE_FILE, raw cookies in
@@ -195,34 +198,63 @@ class YTDLSource:
         if yt_dlp is None:
             raise RuntimeError('yt-dlp is not installed')
         loop = asyncio.get_event_loop()
-        def extract():
-            with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
-                return ydl.extract_info(search, download=False)
+        
+        # Retry logic for rate-limit errors
+        max_retries = 3
+        retry_delays = [3, 10, 30]  # exponential backoff: 3s, 10s, 30s
+        last_error = None
+        
+        for attempt in range(max_retries):
+            def extract():
+                with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
+                    return ydl.extract_info(search, download=False)
 
-        try:
-            data = await asyncio.to_thread(extract)
-        except Exception as exc:
-            s = str(exc)
-            # if format not available, retry without forcing format
-            if 'Requested format is not available' in s:
-                try:
-                    alt_opts = dict(YTDL_OPTS)
-                    alt_opts.pop('format', None)
-                    def extract_alt():
-                        with yt_dlp.YoutubeDL(alt_opts) as ydl:
-                            return ydl.extract_info(search, download=False)
-                    data = await asyncio.to_thread(extract_alt)
-                except Exception:
-                    data = None
-            if data is None:
-                if 'Sign in to confirm' in s or 'cookies' in s.lower():
-                    raise RuntimeError(
-                        'YouTube requires cookies to access this video.\n'
-                        'Provide cookies via env `YTDL_COOKIE_FILE` (path) or `YTDL_COOKIES_BASE64` (base64-encoded cookies.txt).'
-                    )
-                raise RuntimeError(f'yt-dlp error: {s}')
+            try:
+                data = await asyncio.to_thread(extract)
+                break  # success, exit retry loop
+            except Exception as exc:
+                s = str(exc)
+                last_error = s
+                
+                # Check if rate-limited
+                is_rate_limited = 'rate-limited' in s.lower() or 'try again later' in s.lower() or 'HTTP Error 429' in s
+                
+                if is_rate_limited and attempt < max_retries - 1:
+                    delay = retry_delays[attempt]
+                    log.warning(f"⚠️  Rate-limited, retry {attempt+1}/{max_retries-1} after {delay}s...")
+                    await asyncio.sleep(delay)
+                    continue
+                
+                # if format not available, retry without forcing format
+                if 'Requested format is not available' in s:
+                    try:
+                        alt_opts = dict(YTDL_OPTS)
+                        alt_opts.pop('format', None)
+                        def extract_alt():
+                            with yt_dlp.YoutubeDL(alt_opts) as ydl:
+                                return ydl.extract_info(search, download=False)
+                        data = await asyncio.to_thread(extract_alt)
+                        break
+                    except Exception:
+                        data = None
+                
+                if data is None:
+                    if 'Sign in to confirm' in s or 'cookies' in s.lower():
+                        raise RuntimeError(
+                            'YouTube requires cookies to access this video.\n'
+                            'Provide cookies via env `YTDL_COOKIE_FILE` (path) or `YTDL_COOKIES_BASE64` (base64-encoded cookies.txt).'
+                        )
+                    if is_rate_limited:
+                        raise RuntimeError(
+                            '⏳ YouTube rate-limited the session.\n'
+                            'Wait a few minutes and try again, or provide YouTube cookies to bypass limits.\n'
+                            f'Error: {s}'
+                        )
+                    raise RuntimeError(f'yt-dlp error: {s}')
+        
         if data is None:
             raise RuntimeError('No data from yt-dlp')
+        
         log.debug('yt-dlp returned data keys: %s', list(data.keys()) if isinstance(data, dict) else None)
         if 'entries' in data:
             entries = [e for e in data['entries'] if e]
@@ -298,6 +330,7 @@ class YTDLSource:
             'url': stream_url,
             'duration': info.get('duration'),
         }
+
 
 
 class MusicPlayer:
