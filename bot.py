@@ -159,8 +159,8 @@ YTDL_OPTS = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
     },
     'socket_timeout': 30,
-    'sleep_interval': 2,  # 2 giây delay giữa request để tránh rate-limit
-    'max_sleep_interval': 10,
+    'sleep_interval': 5,  # 5 giây delay giữa request để tránh rate-limit (YouTube rate-limits đòi hỏi delay lâu)
+    'max_sleep_interval': 30,  # tối đa 30s delay
 }
 
 # Cookie support: either provide a file path in YTDL_COOKIE_FILE, raw cookies in
@@ -199,9 +199,9 @@ class YTDLSource:
             raise RuntimeError('yt-dlp is not installed')
         loop = asyncio.get_event_loop()
         
-        # Retry logic for rate-limit errors
+        # Retry logic for rate-limit errors (YouTube rate-limits for up to 1 hour!)
         max_retries = 3
-        retry_delays = [3, 10, 30]  # exponential backoff: 3s, 10s, 30s
+        retry_delays = [30, 120, 300]  # exponential backoff: 30s, 2min, 5min
         last_error = None
         
         for attempt in range(max_retries):
@@ -221,7 +221,8 @@ class YTDLSource:
                 
                 if is_rate_limited and attempt < max_retries - 1:
                     delay = retry_delays[attempt]
-                    log.warning(f"⚠️  Rate-limited, retry {attempt+1}/{max_retries-1} after {delay}s...")
+                    delay_min = delay // 60
+                    log.warning(f"⚠️  Rate-limited by YouTube, retry {attempt+1}/{max_retries-1} after {delay_min}m {delay%60}s... (💡 Use YouTube cookies to bypass!)")
                     await asyncio.sleep(delay)
                     continue
                 
