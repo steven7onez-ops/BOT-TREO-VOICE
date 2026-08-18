@@ -204,6 +204,47 @@ if HTTP_PROXY:
 
 
 class YTDLSource:
+    @staticmethod
+    def should_use_local_download(url: str) -> bool:
+        if not url:
+            return False
+        host = urlparse(url).netloc.lower()
+        return any(marker in host for marker in ("googlevideo.com", "googleusercontent.com", "ggpht.com"))
+
+    @classmethod
+    def download_audio_to_temp(cls, search: str, info: dict) -> str:
+        if yt_dlp is None:
+            raise RuntimeError('yt-dlp is not installed')
+
+        tmp_dir = Path(tempfile.mkdtemp(prefix='yt_audio_'))
+        outtmpl = str(tmp_dir / "audio.%(ext)s")
+        opts = dict(YTDL_OPTS)
+        opts.update({
+            'format': 'bestaudio/best',
+            'outtmpl': outtmpl,
+            'noplaylist': True,
+            'quiet': True,
+            'no_warnings': True,
+        })
+
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                downloaded = ydl.extract_info(search, download=True)
+                final_path = ydl.prepare_filename(downloaded)
+            if final_path and os.path.exists(final_path):
+                log.info('Download fallback succeeded for %s -> %s', search, final_path)
+                return final_path
+
+            matches = sorted(tmp_dir.glob('*'))
+            if matches:
+                log.info('Using downloaded audio file %s for %s', matches[0], search)
+                return str(matches[0])
+        except Exception as exc:
+            log.warning('Local download fallback failed for %s: %s', search, exc)
+            raise RuntimeError(f'❌ yt-dlp direct URL failed and local download fallback failed: {exc}')
+
+        raise RuntimeError('❌ Could not download a playable local audio file from YouTube.')
+
     @classmethod
     async def create_source(cls, search: str):
         if yt_dlp is None:
@@ -355,11 +396,22 @@ class YTDLSource:
         if not stream_url:
             raise RuntimeError('Could not find playable stream URL in yt-dlp info')
 
+        if cls.should_use_local_download(stream_url):
+            local_path = cls.download_audio_to_temp(search, info)
+            return {
+                'webpage_url': info.get('webpage_url'),
+                'title': info.get('title'),
+                'url': local_path,
+                'duration': info.get('duration'),
+                'local_file': True,
+            }
+
         return {
             'webpage_url': info.get('webpage_url'),
             'title': info.get('title'),
             'url': stream_url,
             'duration': info.get('duration'),
+            'local_file': False,
         }
 
 
