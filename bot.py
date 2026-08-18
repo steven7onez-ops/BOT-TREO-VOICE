@@ -8,11 +8,14 @@ import collections, random
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ── Logging ───────────────────────────────────────────────────────────────────
+# ── Link Security Module ──────────────────────────────────────────────────────
+from link_security import link_checker
+
+# ── Ghi nhật ký ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger("Bot")
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Cấu hình ────────────────────────────────────────────────────────────────────
 TOKEN          = os.environ["DISCORD_TOKEN"]
 TARGET_GUILD   = int(os.environ.get("GUILD_ID", "0"))
 TARGET_CHANNEL = int(os.environ.get("VOICE_CHANNEL_ID", "0"))
@@ -20,10 +23,10 @@ DASHBOARD_PORT = int(os.environ.get("PORT", "8080"))
 DASHBOARD_KEY  = os.environ.get("DASHBOARD_KEY", "changeme")
 OWNER_ID       = int(os.environ.get("OWNER_ID", "852834067044630558"))
 
-# TikBot-like extras
+# Các tính năng như TikBot
 TIKBOT_STATUS_TEXT = os.environ.get("TIKBOT_STATUS_TEXT", "🎙️ voice channel")
 TIKBOT_VERSION = os.environ.get("TIKBOT_VERSION", "")
-# space-separated list of domains to auto-detect in messages
+# Danh sách các domain cách nhau bằng dấu cách để tự động phát hiện trong tin nhắn
 TIKBOT_AUTO_DOMAINS = os.environ.get("TIKBOT_AUTO_DOMAINS", "youtube tiktok instagram reddit redd.it").split()
 # domains for which the bot should be silent (don't post detection messages)
 TIKBOT_SILENT_DOMAINS = os.environ.get("TIKBOT_SILENT_DOMAINS", "").split()
@@ -70,7 +73,9 @@ class VoiceBot(commands.Bot):
         guild = discord.Object(id=TARGET_GUILD)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
+        await link_checker.init_session()
         log.info("✅ Slash commands đã sync")
+        log.info("✅ Mô-đun Bảo vệ Liên kết đã khởi tạo")
 
     async def on_ready(self):
         log.info(f"✅ Đã đăng nhập: {self.user} (ID: {self.user.id})")
@@ -897,12 +902,92 @@ async def on_message(message: discord.Message):
             except discord.Forbidden:
                 log.warning(f"Không thể gửi thông báo AFK mention ở kênh {message.channel.id} — thiếu quyền")
 
-    # Auto-link detection (TikBot-style): detect configured domains and post a short notice
+    # Kiểm tra an toàn + Phát hiện liên kết: quét tất cả URL và kiểm tra xem có phải là độc hại không
     try:
         urls = re.findall(r'https?://\S+', content)
         if urls:
-            sent = False
             for u in urls:
+                # Kiểm tra xem URL có phải là độc hại/lừa đảo
+                is_malicious, source, reason = await link_checker.check_url(u)
+                
+                if is_malicious:
+                    log.warning(f"🚨 PHÁT HIỆN LINK LỪA ĐẢO: {u} | Nguồn: {source} | Lý do: {reason} | Người dùng: {message.author.name}#{message.author.discriminator}")
+                    
+                    # Vĩnh viễn ban người dùng
+                    try:
+                        await message.guild.ban(
+                            message.author,
+                            reason=f"[TỰ ĐỘNG] Gửi link lừa đảo/scam ({source}: {reason})",
+                            delete_message_days=7
+                        )
+                        log.info(f"✅ Đã ban vĩnh viễn: {message.author.name}#{message.author.discriminator} (ID: {message.author.id})")
+                    except discord.Forbidden:
+                        log.error(f"❌ Không thể ban user {message.author.id} — thiếu quyền")
+                    except Exception as e:
+                        log.error(f"❌ Lỗi khi ban user: {e}")
+                    
+                    # Gửi tin nhắn ban vĩnh viễn cho người dùng qua DM
+                    try:
+                        embed = discord.Embed(
+                            title="🚫 BAN VĨNH VIỄN",
+                            description="Bạn đã bị ban khỏi server.",
+                            color=discord.Color.red()
+                        )
+                        embed.add_field(
+                            name="Lý do",
+                            value="Link lừa đảo / scam",
+                            inline=False
+                        )
+                        embed.add_field(
+                            name="Nguồn",
+                            value=source,
+                            inline=True
+                        )
+                        embed.add_field(
+                            name="Chi tiết",
+                            value=f"```\n{reason}\n```",
+                            inline=False
+                        )
+                        embed.add_field(
+                            name="Link bị phát hiện",
+                            value=f"```\n{u[:100]}{'...' if len(u) > 100 else ''}\n```",
+                            inline=False
+                        )
+                        embed.set_footer(text="Nếu bạn có phản đối, liên hệ admin server.")
+                        
+                        await message.author.send(embed=embed)
+                    except discord.Forbidden:
+                        log.warning(f"Không thể gửi DM cho user {message.author.id} (DM đã đóng)")
+                    except Exception as e:
+                        log.error(f"Lỗi gửi DM: {e}")
+                    
+                    # Xóa tin nhắn độc hại
+                    try:
+                        await message.delete()
+                    except discord.Forbidden:
+                        log.warning(f"Không thể xóa tin nhắn lừa đảo — thiếu quyền")
+                    
+                    # Thông báo cho các mod của kênh
+                    try:
+                        embed = discord.Embed(
+                            title="🚨 PHÁT HIỆN LINK LỪA ĐẢO",
+                            description=f"User **{message.author.name}** đã bị ban vĩnh viễn",
+                            color=discord.Color.red()
+                        )
+                        embed.add_field(name="User", value=f"{message.author.mention} (ID: {message.author.id})", inline=False)
+                        embed.add_field(name="Lý do", value="Gửi link lừa đảo / scam", inline=False)
+                        embed.add_field(name="Nguồn", value=source, inline=True)
+                        embed.add_field(name="Chi tiết", value=f"```\n{reason}\n```", inline=False)
+                        embed.add_field(name="Link", value=f"```\n{u[:100]}{'...' if len(u) > 100 else ''}\n```", inline=False)
+                        
+                        await message.channel.send(embed=embed, delete_after=30)
+                    except discord.Forbidden:
+                        log.warning(f"Không thể gửi thông báo — thiếu quyền")
+                    
+                    return  # Dừng xử lý tin nhắn này
+                
+                # Kiểm tra xem URL có phải từ các domain tự động phát hiện
+                sent = False
                 netloc = urlparse(u).netloc.lower()
                 for dom in TIKBOT_AUTO_DOMAINS:
                     if not dom: continue
@@ -911,14 +996,13 @@ async def on_message(message: discord.Message):
                             sent = True
                             break
                         try:
-                            await message.channel.send(f"🔗 Detected {dom} link: {u}")
+                            await message.channel.send(f"🔗 Phát hiện link {dom}: {u}")
                         except Exception:
                             pass
                         sent = True
                         break
-                if sent: break
-    except Exception:
-        pass
+    except Exception as e:
+        log.error(f"Lỗi kiểm tra URL: {e}")
 
     # Voice Manager: repost panel khi có tin nhắn mới trong kênh voice
     if isinstance(message.channel, discord.VoiceChannel) and voice_manager.is_managed_channel(message.channel.id):
@@ -1766,6 +1850,9 @@ async def main():
     async with asyncio.TaskGroup() as tg:
         tg.create_task(run_web())
         tg.create_task(bot.start(TOKEN))
+    
+    # Cleanup
+    await link_checker.close_session()
 
 if __name__ == "__main__":
     asyncio.run(main())
