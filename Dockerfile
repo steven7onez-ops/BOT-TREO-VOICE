@@ -9,5 +9,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Also keep pip updated
 RUN python -m pip install --upgrade pip
 
-COPY bot.py .
+COPY bot.py link_security.py ./
+ENV PYTHONPATH=/app
 CMD ["python", "-u", "bot.py"]

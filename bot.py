@@ -1,3 +1,10 @@
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -6,7 +13,6 @@ from urllib.parse import urlparse
 from aiohttp import web
 import collections, random
 from datetime import datetime, timezone
-from pathlib import Path
 
 # ── Link Security Module ──────────────────────────────────────────────────────
 from link_security import link_checker
