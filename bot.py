@@ -9,7 +9,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import asyncio, os, logging, json, re, tempfile, shutil, subprocess
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
+from urllib.request import Request, urlopen
 from aiohttp import web
 import collections, random
 from datetime import datetime, timezone
@@ -28,6 +29,22 @@ TARGET_CHANNEL = int(os.environ.get("VOICE_CHANNEL_ID", "0"))
 DASHBOARD_PORT = int(os.environ.get("PORT", "8080"))
 DASHBOARD_KEY  = os.environ.get("DASHBOARD_KEY", "changeme")
 OWNER_ID       = int(os.environ.get("OWNER_ID", "852834067044630558"))
+
+# Anti-nuke: Discord must grant the bot View Audit Log, Manage Roles and,
+# optionally, Ban Members for the configured response action.
+ANTI_NUKE_ENABLED = os.environ.get("ANTI_NUKE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+ANTI_NUKE_ACTION = os.environ.get("ANTI_NUKE_ACTION", "strip").lower()  # strip or ban
+ANTI_NUKE_LOG_CHANNEL_ID = int(os.environ.get("ANTI_NUKE_LOG_CHANNEL_ID", "0"))
+ANTI_NUKE_WINDOW_SECONDS = int(os.environ.get("ANTI_NUKE_WINDOW_SECONDS", "30"))
+ANTI_NUKE_CHANNEL_LIMIT = int(os.environ.get("ANTI_NUKE_CHANNEL_LIMIT", "3"))
+ANTI_NUKE_ROLE_LIMIT = int(os.environ.get("ANTI_NUKE_ROLE_LIMIT", "3"))
+ANTI_NUKE_BAN_LIMIT = int(os.environ.get("ANTI_NUKE_BAN_LIMIT", "5"))
+ANTI_NUKE_KICK_LIMIT = int(os.environ.get("ANTI_NUKE_KICK_LIMIT", "5"))
+ANTI_NUKE_WEBHOOK_LIMIT = int(os.environ.get("ANTI_NUKE_WEBHOOK_LIMIT", "3"))
+ANTI_NUKE_TRUSTED_IDS = {
+    int(user_id) for user_id in os.environ.get("ANTI_NUKE_TRUSTED_IDS", str(OWNER_ID)).split()
+    if user_id.isdigit()
+}
 
 # Các tính năng như TikBot
 TIKBOT_STATUS_TEXT = os.environ.get("TIKBOT_STATUS_TEXT", "🎙️ voice channel")
@@ -74,6 +91,8 @@ class VoiceBot(commands.Bot):
         self.auto_rejoin: bool         = True
         self.follow_owner: bool        = True
         self.start_time                = datetime.now(timezone.utc)
+        self.anti_nuke_actions: dict[tuple[int, int, str], collections.deque] = {}
+        self.anti_nuke_entries: set[int] = set()
 
     async def setup_hook(self):
         guild = discord.Object(id=TARGET_GUILD)
@@ -93,6 +112,97 @@ class VoiceBot(commands.Bot):
         await self.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name=status_text))
         if self.permanent_channel_id:
             await self._join_by_id(self.permanent_channel_id, label="kênh vĩnh viễn")
+
+    def _anti_nuke_is_trusted(self, member: discord.Member) -> bool:
+        return member.id in ANTI_NUKE_TRUSTED_IDS or member.id == self.user.id
+
+    async def _anti_nuke_log(self, guild: discord.Guild, message: str):
+        log.warning("[ANTI-NUKE] %s | %s", guild.name, message)
+        if not ANTI_NUKE_LOG_CHANNEL_ID:
+            return
+        channel = guild.get_channel(ANTI_NUKE_LOG_CHANNEL_ID)
+        if channel and hasattr(channel, "send"):
+            try:
+                await channel.send(f"🛡️ **Anti-nuke**: {message}")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+    async def _anti_nuke_quarantine(self, guild: discord.Guild, executor: discord.Member, reason: str):
+        if self._anti_nuke_is_trusted(executor):
+            await self._anti_nuke_log(guild, f"Bỏ qua executor tin cậy: {executor} ({reason})")
+            return
+
+        if ANTI_NUKE_ACTION == "ban" and guild.me and guild.me.guild_permissions.ban_members:
+            try:
+                await guild.ban(executor, reason=f"Anti-nuke: {reason}", delete_message_seconds=0)
+                await self._anti_nuke_log(guild, f"Đã ban {executor} vì {reason}")
+                return
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                log.warning("[ANTI-NUKE] Không thể ban %s: %s", executor, exc)
+
+        if guild.me and guild.me.guild_permissions.manage_roles:
+            manageable_roles = [role for role in executor.roles if role < guild.me.top_role and not role.is_default()]
+            try:
+                if manageable_roles:
+                    await executor.remove_roles(*manageable_roles, reason=f"Anti-nuke: {reason}")
+                await self._anti_nuke_log(guild, f"Đã tước {len(manageable_roles)} role của {executor} vì {reason}")
+                return
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                log.warning("[ANTI-NUKE] Không thể tước role của %s: %s", executor, exc)
+        await self._anti_nuke_log(guild, f"Phát hiện {executor} vượt ngưỡng nhưng bot không đủ quyền: {reason}")
+
+    async def _anti_nuke_audit_event(self, guild: discord.Guild, action, target_id: int | None, kind: str, limit: int):
+        if not ANTI_NUKE_ENABLED or not guild.me or not guild.me.guild_permissions.view_audit_log:
+            return
+        await asyncio.sleep(1)
+        try:
+            async for entry in guild.audit_logs(limit=10, action=action):
+                if entry.id in self.anti_nuke_entries:
+                    continue
+                if entry.created_at and (datetime.now(timezone.utc) - entry.created_at).total_seconds() > 15:
+                    continue
+                if target_id is not None and getattr(entry.target, "id", None) != target_id:
+                    continue
+                self.anti_nuke_entries.add(entry.id)
+                executor = entry.user
+                if not isinstance(executor, discord.Member):
+                    executor = guild.get_member(getattr(entry.user, "id", 0))
+                if not executor or self._anti_nuke_is_trusted(executor):
+                    return
+                now = datetime.now(timezone.utc).timestamp()
+                key = (guild.id, executor.id, kind)
+                actions = self.anti_nuke_actions.setdefault(key, collections.deque())
+                actions.append(now)
+                while actions and now - actions[0] > ANTI_NUKE_WINDOW_SECONDS:
+                    actions.popleft()
+                if len(actions) >= limit:
+                    actions.clear()
+                    await self._anti_nuke_quarantine(guild, executor, f"{kind} {limit} lần trong {ANTI_NUKE_WINDOW_SECONDS}s")
+                return
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            log.warning("[ANTI-NUKE] Không đọc được Audit Log của %s: %s", guild.name, exc)
+
+    async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
+        await self._anti_nuke_audit_event(channel.guild, discord.AuditLogAction.channel_delete, channel.id, "xóa kênh", ANTI_NUKE_CHANNEL_LIMIT)
+
+    async def on_guild_channel_create(self, channel: discord.abc.GuildChannel):
+        await self._anti_nuke_audit_event(channel.guild, discord.AuditLogAction.channel_create, channel.id, "tạo kênh", ANTI_NUKE_CHANNEL_LIMIT)
+
+    async def on_guild_role_delete(self, role: discord.Role):
+        await self._anti_nuke_audit_event(role.guild, discord.AuditLogAction.role_delete, role.id, "xóa role", ANTI_NUKE_ROLE_LIMIT)
+
+    async def on_guild_role_create(self, role: discord.Role):
+        await self._anti_nuke_audit_event(role.guild, discord.AuditLogAction.role_create, role.id, "tạo role", ANTI_NUKE_ROLE_LIMIT)
+
+    async def on_member_ban(self, guild: discord.Guild, user: discord.User):
+        await self._anti_nuke_audit_event(guild, discord.AuditLogAction.ban, user.id, "ban user", ANTI_NUKE_BAN_LIMIT)
+
+    async def on_member_remove(self, member: discord.Member):
+        await self._anti_nuke_audit_event(member.guild, discord.AuditLogAction.kick, member.id, "kick user", ANTI_NUKE_KICK_LIMIT)
+
+    async def on_webhooks_update(self, channel: discord.abc.GuildChannel):
+        await self._anti_nuke_audit_event(channel.guild, discord.AuditLogAction.webhook_create, None, "tạo webhook", ANTI_NUKE_WEBHOOK_LIMIT)
+        await self._anti_nuke_audit_event(channel.guild, discord.AuditLogAction.webhook_delete, None, "xóa webhook", ANTI_NUKE_WEBHOOK_LIMIT)
 
     # ── Treo voice logic (giữ nguyên từ bản cũ) ──────────────────────────────
     async def on_voice_state_update(self, member, before, after):
@@ -205,6 +315,41 @@ if HTTP_PROXY:
 
 class YTDLSource:
     @staticmethod
+    def source_name(search: str) -> str:
+        host = urlparse(search).netloc.lower().split(':', 1)[0]
+        if host == "spotify.com" or host.endswith(".spotify.com") or host == "spotify.link":
+            return "Spotify"
+        if "soundcloud.com" in host:
+            return "SoundCloud"
+        return "YouTube"
+
+    @staticmethod
+    def _is_spotify_url(search: str) -> bool:
+        host = urlparse(search).netloc.lower().split(':', 1)[0]
+        return host == "spotify.com" or host.endswith(".spotify.com") or host == "spotify.link"
+
+    @staticmethod
+    def _spotify_search_query(info: dict) -> str | None:
+        title = info.get('track') or info.get('title')
+        artist = info.get('artist') or info.get('author_name') or info.get('uploader') or info.get('creator')
+        if not title:
+            return None
+        return f"ytsearch1:{artist} - {title}" if artist else f"ytsearch1:{title}"
+
+    @staticmethod
+    def _spotify_oembed_query(url: str) -> str | None:
+        request = Request(
+            f"https://open.spotify.com/oembed?url={quote(url, safe='')}",
+            headers={'User-Agent': YTDL_OPTS['http_headers']['User-Agent']},
+        )
+        with urlopen(request, timeout=15) as response:
+            metadata = json.loads(response.read().decode('utf-8'))
+        return YTDLSource._spotify_search_query({
+            'title': metadata.get('title'),
+            'artist': metadata.get('author_name'),
+        })
+
+    @staticmethod
     def should_use_local_download(url: str) -> bool:
         if not url:
             return False
@@ -251,6 +396,19 @@ class YTDLSource:
             raise RuntimeError('yt-dlp is not installed')
         loop = asyncio.get_event_loop()
         
+        # Spotify has no audio extractor in yt-dlp; resolve its public metadata first.
+        if cls._is_spotify_url(search):
+            try:
+                spotify_query = await asyncio.to_thread(cls._spotify_oembed_query, search)
+            except Exception as exc:
+                raise RuntimeError(f'Không đọc được metadata Spotify: {exc}') from exc
+            if not spotify_query:
+                raise RuntimeError('Không đọc được tên bài hát Spotify. Hãy dùng link bài hát cụ thể.')
+            source_name = "Spotify"
+        else:
+            source_name = cls.source_name(search)
+            search = spotify_query
+
         # Retry logic for rate-limit errors (YouTube rate-limits for up to 1 hour!)
         max_retries = 3
         retry_delays = [30, 120, 300]  # exponential backoff: 30s, 2min, 5min
@@ -259,7 +417,8 @@ class YTDLSource:
         
         for attempt in range(max_retries):
             def extract():
-                with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
+                opts = dict(YTDL_OPTS)
+                with yt_dlp.YoutubeDL(opts) as ydl:
                     return ydl.extract_info(search, download=False)
 
             try:
@@ -404,6 +563,7 @@ class YTDLSource:
                 'url': local_path,
                 'duration': info.get('duration'),
                 'local_file': True,
+                'source': source_name,
             }
 
         return {
@@ -412,6 +572,7 @@ class YTDLSource:
             'url': stream_url,
             'duration': info.get('duration'),
             'local_file': False,
+            'source': source_name,
         }
 
 
@@ -771,7 +932,7 @@ async def play_cmd(ctx: commands.Context, *, query: str = None):
             vc.stop()
         except Exception:
             pass
-    await ctx.send(f"▶️ Đã phát ngay: **{src['title']}**")
+    await ctx.send(f"▶️ Đã phát ngay: **{src['title']}** · Nguồn: {src.get('source', 'YouTube')}")
 
 
 @bot.command(name='queue')
@@ -788,7 +949,7 @@ async def queue_cmd(ctx: commands.Context, *, query: str = None):
         return await ctx.reply(f"❌ Lỗi khi thêm vào queue: {e}")
     player = get_player(ctx.guild)
     player.queue.append({'title': src['title'], 'url': src['url'], 'webpage_url': src['webpage_url'], 'requester': ctx.author.display_name})
-    await ctx.send(f"➕ Đã thêm vào queue: **{src['title']}**")
+    await ctx.send(f"➕ Đã thêm vào queue: **{src['title']}** · Nguồn: {src.get('source', 'YouTube')}")
 
 
 @bot.command(name='checkqueue')
@@ -1473,8 +1634,13 @@ async def help_cmd(ctx: commands.Context):
               "Tự tắt khi bạn gõ tin nhắn bất kỳ\n"
               "Bot sẽ báo mọi người khi có ai tag bạn lúc AFK",
         inline=False)
+    embed.add_field(name="🛡️ Anti-nuke",
+        value="Tự giám sát Audit Log và phản ứng khi có xóa kênh/role, ban/kick hoặc webhook hàng loạt. Cần bật cấu hình anti-nuke và cấp quyền Audit Log.",
+        inline=False)
     embed.add_field(name="🎵 Music (voice)",
         value=("`+play <link|search>` / `+p` — Phát ngay\n"
+               "Nguồn hỗ trợ: YouTube, Spotify (link bài hát), SoundCloud\n"
+               "Spotify sẽ tìm bản phát tương ứng trên YouTube; SoundCloud phát trực tiếp qua yt-dlp.\n"
                "`+pause` — Tạm dừng\n"
                "`+stop` — Dừng và xoá bài đang phát\n"
                "`+queue <link|search>` — Thêm bài vào queue\n"
