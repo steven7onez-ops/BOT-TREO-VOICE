@@ -28,7 +28,7 @@ TARGET_GUILD   = int(os.environ.get("GUILD_ID", "0"))
 TARGET_CHANNEL = int(os.environ.get("VOICE_CHANNEL_ID", "0"))
 DASHBOARD_PORT = int(os.environ.get("PORT", "8080"))
 DASHBOARD_KEY  = os.environ.get("DASHBOARD_KEY", "changeme")
-OWNER_ID       = int(os.environ.get("OWNER_ID", "852834067044630558"))
+OWNER_ID       = int(os.environ.get("OWNER_ID", "0"))
 
 # Anti-nuke: Discord must grant the bot View Audit Log, Manage Roles and,
 # optionally, Ban Members for the configured response action.
@@ -42,7 +42,7 @@ ANTI_NUKE_BAN_LIMIT = int(os.environ.get("ANTI_NUKE_BAN_LIMIT", "5"))
 ANTI_NUKE_KICK_LIMIT = int(os.environ.get("ANTI_NUKE_KICK_LIMIT", "5"))
 ANTI_NUKE_WEBHOOK_LIMIT = int(os.environ.get("ANTI_NUKE_WEBHOOK_LIMIT", "3"))
 ANTI_NUKE_TRUSTED_IDS = {
-    int(user_id) for user_id in os.environ.get("ANTI_NUKE_TRUSTED_IDS", str(OWNER_ID)).split()
+    int(user_id) for user_id in os.environ.get("ANTI_NUKE_TRUSTED_IDS", "").split()
     if user_id.isdigit()
 }
 
@@ -57,6 +57,7 @@ TIKBOT_MAX_UPLOAD_MB = int(os.environ.get("TIKBOT_MAX_UPLOAD_MB", "50"))
 
 PROFILE_DB_FILE = Path("/tmp/profiles.json")
 VC_STATE_FILE   = Path("/tmp/vc_state.json") # kênh nào đang có panel mở + message id
+ANTI_NUKE_DB_FILE = Path("/tmp/anti_nuke_config.json")
 
 # ── JSON DB helpers ───────────────────────────────────────────────────────────
 def load_json(path: Path) -> dict:
@@ -72,6 +73,24 @@ def load_profiles():   return load_json(PROFILE_DB_FILE)
 def save_profiles(db): save_json(PROFILE_DB_FILE, db)
 def load_vc_state():   return load_json(VC_STATE_FILE)
 def save_vc_state(d):  save_json(VC_STATE_FILE, d)
+
+ANTI_NUKE_DEFAULTS = {
+    "enabled": ANTI_NUKE_ENABLED,
+    "action": ANTI_NUKE_ACTION if ANTI_NUKE_ACTION in ("strip", "ban") else "strip",
+    "log_channel_id": ANTI_NUKE_LOG_CHANNEL_ID,
+}
+
+def load_anti_nuke_config(guild_id: int) -> dict:
+    config = load_json(ANTI_NUKE_DB_FILE).get(str(guild_id), {})
+    result = dict(ANTI_NUKE_DEFAULTS)
+    result.update({key: config[key] for key in ANTI_NUKE_DEFAULTS if key in config})
+    result["owner_id"] = int(config.get("owner_id", 0) or 0)
+    return result
+
+def save_anti_nuke_config(guild_id: int, config: dict):
+    database = load_json(ANTI_NUKE_DB_FILE)
+    database[str(guild_id)] = config
+    save_json(ANTI_NUKE_DB_FILE, database)
 
 # ── Intents ───────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -113,14 +132,21 @@ class VoiceBot(commands.Bot):
         if self.permanent_channel_id:
             await self._join_by_id(self.permanent_channel_id, label="kênh vĩnh viễn")
 
+    def get_owner_id(self, guild_id: int) -> int:
+        configured_owner = load_anti_nuke_config(guild_id)["owner_id"]
+        return configured_owner or OWNER_ID
+
     def _anti_nuke_is_trusted(self, member: discord.Member) -> bool:
-        return member.id in ANTI_NUKE_TRUSTED_IDS or member.id == self.user.id
+        return (member.id in ANTI_NUKE_TRUSTED_IDS
+                or member.id == self.get_owner_id(member.guild.id)
+                or member.id == self.user.id)
 
     async def _anti_nuke_log(self, guild: discord.Guild, message: str):
         log.warning("[ANTI-NUKE] %s | %s", guild.name, message)
-        if not ANTI_NUKE_LOG_CHANNEL_ID:
+        log_channel_id = load_anti_nuke_config(guild.id)["log_channel_id"]
+        if not log_channel_id:
             return
-        channel = guild.get_channel(ANTI_NUKE_LOG_CHANNEL_ID)
+        channel = guild.get_channel(log_channel_id)
         if channel and hasattr(channel, "send"):
             try:
                 await channel.send(f"🛡️ **Anti-nuke**: {message}")
@@ -132,7 +158,8 @@ class VoiceBot(commands.Bot):
             await self._anti_nuke_log(guild, f"Bỏ qua executor tin cậy: {executor} ({reason})")
             return
 
-        if ANTI_NUKE_ACTION == "ban" and guild.me and guild.me.guild_permissions.ban_members:
+        config = load_anti_nuke_config(guild.id)
+        if config["action"] == "ban" and guild.me and guild.me.guild_permissions.ban_members:
             try:
                 await guild.ban(executor, reason=f"Anti-nuke: {reason}", delete_message_seconds=0)
                 await self._anti_nuke_log(guild, f"Đã ban {executor} vì {reason}")
@@ -152,7 +179,7 @@ class VoiceBot(commands.Bot):
         await self._anti_nuke_log(guild, f"Phát hiện {executor} vượt ngưỡng nhưng bot không đủ quyền: {reason}")
 
     async def _anti_nuke_audit_event(self, guild: discord.Guild, action, target_id: int | None, kind: str, limit: int):
-        if not ANTI_NUKE_ENABLED or not guild.me or not guild.me.guild_permissions.view_audit_log:
+        if not load_anti_nuke_config(guild.id)["enabled"] or not guild.me or not guild.me.guild_permissions.view_audit_log:
             return
         await asyncio.sleep(1)
         try:
@@ -219,7 +246,7 @@ class VoiceBot(commands.Bot):
             return
 
         # Follow chủ vào voice (tính năng treo voice cũ)
-        if member.id == OWNER_ID and self.follow_owner:
+        if member.id == self.get_owner_id(member.guild.id) and self.follow_owner:
             if after.channel and after.channel != before.channel:
                 ch = after.channel
                 log.info(f"👤 Chủ vào #{ch.name} — bot follow theo")
@@ -894,6 +921,146 @@ class VoiceManagerImpl:
 
 
 voice_manager = VoiceManagerImpl(bot)
+
+
+# ── Cấu hình owner và Anti-nuke theo từng server ─────────────────────────────
+def is_configured_owner(ctx: commands.Context) -> bool:
+    return bool(ctx.guild and ctx.author.id == bot.get_owner_id(ctx.guild.id))
+
+
+def anti_nuke_embed(guild: discord.Guild) -> discord.Embed:
+    config = load_anti_nuke_config(guild.id)
+    log_channel = guild.get_channel(config["log_channel_id"]) if config["log_channel_id"] else None
+    embed = discord.Embed(title="🛡️ Anti-nuke", color=0x2ecc71 if config["enabled"] else 0xe74c3c)
+    embed.add_field(name="Trạng thái", value="✅ Đang bật" if config["enabled"] else "⛔ Đang tắt", inline=True)
+    embed.add_field(name="Hành động", value="Ban" if config["action"] == "ban" else "Tước role", inline=True)
+    embed.add_field(name="Kênh log", value=log_channel.mention if log_channel else "Chưa đặt", inline=True)
+    embed.add_field(
+        name="Ngưỡng hiện tại",
+        value=(f"Kênh: {ANTI_NUKE_CHANNEL_LIMIT} · Role: {ANTI_NUKE_ROLE_LIMIT}\n"
+               f"Ban/kick: {ANTI_NUKE_BAN_LIMIT}/{ANTI_NUKE_KICK_LIMIT} · Webhook: {ANTI_NUKE_WEBHOOK_LIMIT}\n"
+               f"Cửa sổ: {ANTI_NUKE_WINDOW_SECONDS} giây"),
+        inline=False,
+    )
+    embed.set_footer(text="Chỉ owner đã cấu hình mới dùng được menu này")
+    return embed
+
+
+class AntiNukeView(discord.ui.View):
+    def __init__(self, guild_id: int, owner_id: int):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("❌ Chỉ owner đã cấu hình mới dùng được menu này.", ephemeral=True)
+            return False
+        return True
+
+    async def refresh(self, interaction: discord.Interaction, message: str):
+        if not interaction.guild:
+            return
+        await interaction.response.edit_message(
+            content=message, embed=anti_nuke_embed(interaction.guild), view=self
+        )
+
+
+class AntiNukeActionSelect(discord.ui.Select):
+    def __init__(self, view: AntiNukeView):
+        self.anti_nuke_view = view
+        super().__init__(
+            placeholder="Chọn hành động khi phát hiện nuke",
+            options=[
+                discord.SelectOption(label="Tước role quản trị", value="strip", emoji="🧹"),
+                discord.SelectOption(label="Ban executor", value="ban", emoji="🔨"),
+            ],
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        config = load_anti_nuke_config(self.anti_nuke_view.guild_id)
+        config["action"] = self.values[0]
+        save_anti_nuke_config(self.anti_nuke_view.guild_id, config)
+        await self.anti_nuke_view.refresh(interaction, "✅ Đã cập nhật hành động anti-nuke.")
+
+
+class AntiNukeLogChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, view: AntiNukeView):
+        self.anti_nuke_view = view
+        super().__init__(
+            placeholder="Chọn kênh nhận cảnh báo",
+            channel_types=[discord.ChannelType.text],
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        config = load_anti_nuke_config(self.anti_nuke_view.guild_id)
+        config["log_channel_id"] = self.values[0].id
+        save_anti_nuke_config(self.anti_nuke_view.guild_id, config)
+        await self.anti_nuke_view.refresh(interaction, "✅ Đã đặt kênh log anti-nuke.")
+
+
+class AntiNukeToggleButton(discord.ui.Button):
+    def __init__(self, view: AntiNukeView):
+        self.anti_nuke_view = view
+        super().__init__(label="Bật / tắt giám sát", style=discord.ButtonStyle.primary, emoji="🛡️")
+
+    async def callback(self, interaction: discord.Interaction):
+        config = load_anti_nuke_config(self.anti_nuke_view.guild_id)
+        config["enabled"] = not config["enabled"]
+        save_anti_nuke_config(self.anti_nuke_view.guild_id, config)
+        await self.anti_nuke_view.refresh(interaction, "✅ Đã cập nhật trạng thái anti-nuke.")
+
+
+class AntiNukeClearLogButton(discord.ui.Button):
+    def __init__(self, view: AntiNukeView):
+        self.anti_nuke_view = view
+        super().__init__(label="Tắt kênh log", style=discord.ButtonStyle.secondary, emoji="🔕")
+
+    async def callback(self, interaction: discord.Interaction):
+        config = load_anti_nuke_config(self.anti_nuke_view.guild_id)
+        config["log_channel_id"] = 0
+        save_anti_nuke_config(self.anti_nuke_view.guild_id, config)
+        await self.anti_nuke_view.refresh(interaction, "✅ Đã tắt kênh log anti-nuke.")
+
+
+def build_anti_nuke_view(guild_id: int, owner_id: int) -> AntiNukeView:
+    view = AntiNukeView(guild_id, owner_id)
+    view.add_item(AntiNukeActionSelect(view))
+    view.add_item(AntiNukeLogChannelSelect(view))
+    view.add_item(AntiNukeToggleButton(view))
+    view.add_item(AntiNukeClearLogButton(view))
+    return view
+
+
+@bot.command(name="set_owner", aliases=["owner_id"])
+async def set_owner_cmd(ctx: commands.Context, owner_id: str = ""):
+    if not ctx.guild:
+        return await ctx.reply("❌ Lệnh này chỉ dùng được trong server.")
+    current_owner_id = load_anti_nuke_config(ctx.guild.id)["owner_id"]
+    if ctx.author.id != ctx.guild.owner_id and ctx.author.id != current_owner_id:
+        return await ctx.reply("❌ Chỉ Server Owner hoặc owner đã cấu hình mới được đặt owner ID.")
+    match = re.fullmatch(r"<?@!?(\d+)>?", owner_id.strip())
+    if not match:
+        return await ctx.reply("❌ Dùng: `+set_owner <user_id>` (có thể nhập mention).")
+    if int(match.group(1)) != ctx.author.id:
+        return await ctx.reply("❌ Owner chỉ có thể nhập ID của chính mình.")
+    config = load_anti_nuke_config(ctx.guild.id)
+    config["owner_id"] = int(match.group(1))
+    save_anti_nuke_config(ctx.guild.id, config)
+    await ctx.reply(f"✅ Đã đặt owner anti-nuke cho server này: <@{config['owner_id']}>")
+
+
+@bot.command(name="anti_nuke")
+async def anti_nuke_cmd(ctx: commands.Context):
+    if not ctx.guild:
+        return await ctx.reply("❌ Lệnh này chỉ dùng được trong server.")
+    owner_id = load_anti_nuke_config(ctx.guild.id)["owner_id"]
+    if not owner_id:
+        return await ctx.reply("❌ Chưa có owner ID. Server Owner hãy nhập `+set_owner <owner_id>` trước.")
+    if ctx.author.id != owner_id:
+        return await ctx.reply("❌ Chỉ owner đã cấu hình mới được mở menu anti-nuke.")
+    view = build_anti_nuke_view(ctx.guild.id, owner_id)
+    await ctx.reply(embed=anti_nuke_embed(ctx.guild), view=view)
 
 
 # ── Lệnh mở panel: +voice_control ─────────────────────────────────────────────
@@ -1635,7 +1802,9 @@ async def help_cmd(ctx: commands.Context):
               "Bot sẽ báo mọi người khi có ai tag bạn lúc AFK",
         inline=False)
     embed.add_field(name="🛡️ Anti-nuke",
-        value="Tự giám sát Audit Log và phản ứng khi có xóa kênh/role, ban/kick hoặc webhook hàng loạt. Cần bật cấu hình anti-nuke và cấp quyền Audit Log.",
+        value="`+set_owner <id>` — Server Owner đặt owner cho server\n"
+              "`+anti_nuke` — Owner mở menu bật/tắt, chọn hành động và kênh log\n"
+              "Tự giám sát Audit Log và phản ứng khi có xóa kênh/role, ban/kick hoặc webhook hàng loạt.",
         inline=False)
     embed.add_field(name="🎵 Music (voice)",
         value=("`+play <link|search>` / `+p` — Phát ngay\n"

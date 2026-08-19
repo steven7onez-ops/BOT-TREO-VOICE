@@ -38,6 +38,29 @@ Bot Python (discord.py 2.4+) với 3 tính năng chính:
 
 ---
 
+## 🚀 Setup
+
+### Bước 1 — Upload lên GitHub
+Upload toàn bộ file trong thư mục này lên repo GitHub hiện có (ghi đè `bot.py`, `requirements.txt`, `Dockerfile`).
+
+### Bước 2 — Railway tự động redeploy
+Railway sẽ tự build lại với Python 3.13 + code mới.
+
+### Bước 3 — Setup Voice Manager trong Discord
+Sau khi bot online, chạy lệnh:
+```
+/voice_setup ten_hub:➕ Tạo kênh thoại mau_ten:🔊 Kênh của {user}
+```
+
+Xong! Giờ ai join vào kênh "➕ Tạo kênh thoại" sẽ tự có kênh riêng.
+
+### Bước 4 (tuỳ chọn) — Sửa cấu hình sau này
+```
+/voice_config mau_ten:🎮 Phòng của {user}
+```
+
+---
+
 ## 📋 Danh sách lệnh
 
 ### Prefix (+)
@@ -53,7 +76,15 @@ Bot Python (discord.py 2.4+) với 3 tính năng chính:
 
 ### 🛡️ Anti-nuke Monitoring
 
-Anti-nuke theo dõi việc xóa kênh, xóa role, ban/kick hàng loạt và tạo/xóa webhook qua Discord Audit Log. Khi một executor vượt ngưỡng trong thời gian ngắn, bot mặc định tước các role quản trị có thể tước được. Đặt `ANTI_NUKE_ACTION=ban` nếu muốn bot ban executor thay vì tước role.
+Anti-nuke theo dõi việc xóa kênh, xóa role, ban/kick hàng loạt và tạo/xóa webhook qua Discord Audit Log. Cấu hình được lưu riêng theo từng server, nên một bot có thể dùng cho nhiều server.
+
+Sau khi bot online, Server Owner nhập:
+```text
++set_owner <owner_id>
+```
+Owner đã cấu hình có thể nhập `+anti_nuke` để mở menu và chọn bật/tắt giám sát, hành động (tước role hoặc ban) và kênh nhận cảnh báo. Chỉ owner đã cấu hình mới mở và sử dụng được menu.
+
+`OWNER_ID` vẫn được hỗ trợ như giá trị dự phòng cho tính năng follow voice cũ, nhưng không cần khai báo biến này để cấu hình anti-nuke.
 
 Bot không thể xử lý Server Owner, user có role cao hơn bot, hoặc hành động xảy ra khi bot đã bị mất quyền/kick.
 
@@ -91,7 +122,7 @@ Spotify chỉ cung cấp thông tin bài hát nên bot sẽ tìm bản phát tư
 | `DISCORD_TOKEN` | ✅ | Token bot |
 | `GUILD_ID` | ✅ | ID server |
 | `VOICE_CHANNEL_ID` | ⬜ | ID kênh vĩnh viễn (treo voice cũ) |
-| `OWNER_ID` | ⬜ | ID người bot sẽ follow (mặc định có sẵn) |
+| `OWNER_ID` | ⬜ | ID dự phòng cho tính năng bot follow voice; có thể bỏ qua khi dùng `+set_owner` |
 | `DASHBOARD_KEY` | ✅ | Mật khẩu dashboard web |
 | `PORT` | ⬜ | Port dashboard (Railway tự set) |
 
@@ -102,7 +133,7 @@ Spotify chỉ cung cấp thông tin bài hát nên bot sẽ tìm bản phát tư
 | `ANTI_NUKE_ENABLED` | `true` | Bật/tắt giám sát |
 | `ANTI_NUKE_ACTION` | `strip` | `strip` tước role; `ban` ban executor |
 | `ANTI_NUKE_LOG_CHANNEL_ID` | `0` | ID kênh nhận cảnh báo; `0` chỉ ghi log container |
-| `ANTI_NUKE_TRUSTED_IDS` | `OWNER_ID` | Danh sách user ID tin cậy, cách nhau bằng dấu cách |
+| `ANTI_NUKE_TRUSTED_IDS` | trống | Danh sách user ID tin cậy bổ sung, cách nhau bằng dấu cách |
 | `ANTI_NUKE_WINDOW_SECONDS` | `30` | Cửa sổ tính hành vi |
 | `ANTI_NUKE_CHANNEL_LIMIT` | `3` | Số kênh bị xóa để kích hoạt |
 | `ANTI_NUKE_ROLE_LIMIT` | `3` | Số role bị xóa để kích hoạt |
@@ -138,6 +169,48 @@ export TIKBOT_MAX_UPLOAD_MB=50
 python bot.py
 ```
 
+### YouTube cookies (khi yt-dlp báo "Sign in to confirm you're not a bot")
+
+Một số video YouTube yêu cầu cookie (ví dụ video age-restricted, region-restricted hoặc khi YouTube bật kiểm tra bot). Nếu bạn thấy lỗi như "Sign in to confirm you're not a bot" hoặc hướng dẫn dùng `--cookies-from-browser`, thực hiện một trong các cách sau:
+
+- Xuất cookies từ trình duyệt thành file `cookies.txt` bằng extension `cookies.txt` hoặc `EditThisCookie`.
+- Đặt cookie cho bot bằng một trong 2 cách:
+	- Upload file `cookies.txt` vào container và set biến môi trường `YTDL_COOKIE_FILE` trỏ tới đường dẫn file trong container (ví dụ `/app/cookies.txt`).
+	- Hoặc base64-encode nội dung `cookies.txt` rồi set vào biến môi trường `YTDL_COOKIES_BASE64` (an toàn hơn để lưu dưới dạng secret). Bot sẽ giải mã và ghi tạm file cookies khi cần.
+
+Ví dụ mã hóa file trên Linux/macOS:
+```bash
+base64 cookies.txt | tr -d '\n'  # copy kết quả đặt vào YTDL_COOKIES_BASE64
+```
+Ví dụ trên Windows PowerShell:
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes('cookies.txt'))
+```
+
+Sau đó trong Railway/GitHub Actions/ENV thêm biến `YTDL_COOKIES_BASE64` (secret) với giá trị base64 thu được, hoặc upload `cookies.txt` và set `YTDL_COOKIE_FILE`.
+
+Lưu ý: Cookies có thể hết hạn; nếu lỗi quay lại, xuất cookies mới và cập nhật secret.
+
+### Triển khai nhanh (Railway / Docker)
+- Repo đã có `Dockerfile` (cài `ffmpeg` + Python deps). Push lên GitHub và kết nối repo với Railway; Railway sẽ build Docker image tự động.
+- Trên Railway (hoặc môi trường deploy khác) set các Variables tương ứng (DISCORD_TOKEN, GUILD_ID, DASHBOARD_KEY, v.v.).
+
+### Đẩy code lên GitHub (nhanh)
+1. Khởi tạo git trong thư mục (nếu chưa):
+```bash
+git init
+git add .
+git commit -m "Initial bot commit"
+git branch -M main
+git remote add origin https://github.com/<your-username>/<your-repo>.git
+git push -u origin main
+```
+2. (Tuỳ chọn) Thêm secrets trên GitHub (Settings → Secrets) nếu bạn muốn GH Actions push Docker image:
+	- `DOCKERHUB_USERNAME`
+	- `DOCKERHUB_TOKEN`
+	- Thêm `DOCKERHUB_REPOSITORY` dưới `Repository > Settings > Environments` hoặc qua `Actions` env.
+
+Sau khi push, GitHub Actions `CI` sẽ chạy: kiểm tra syntax, cài dependencies và (nếu cấu hình) build/push image.
 ---
 
 ## 🔑 Quyền bot cần thêm

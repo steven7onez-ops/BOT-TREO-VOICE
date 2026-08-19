@@ -11,6 +11,24 @@ import bot
 
 
 class YtdlFallbackTest(unittest.TestCase):
+    def test_music_source_names(self):
+        self.assertEqual(bot.YTDLSource.source_name("https://open.spotify.com/track/abc"), "Spotify")
+        self.assertEqual(bot.YTDLSource.source_name("https://spotify.link/abc"), "Spotify")
+        self.assertEqual(bot.YTDLSource.source_name("https://soundcloud.com/artist/track"), "SoundCloud")
+        self.assertEqual(bot.YTDLSource.source_name("never gonna give you up"), "YouTube")
+
+    def test_spotify_query_uses_track_and_artist(self):
+        self.assertEqual(
+            bot.YTDLSource._spotify_search_query({"track": "Track", "artist": "Artist"}),
+            "ytsearch1:Artist - Track",
+        )
+
+    def test_spotify_oembed_query_uses_metadata(self):
+        self.assertEqual(
+            bot.YTDLSource._spotify_search_query({"title": "Track", "author_name": "Artist"}),
+            "ytsearch1:Artist - Track",
+        )
+
     def test_googlevideo_url_requires_local_download(self):
         url = "https://rr4---sn-ojn4v5-55.googlevideo.com/videoplayback?expire=123&sig=abc"
         self.assertTrue(bot.YTDLSource.should_use_local_download(url))
