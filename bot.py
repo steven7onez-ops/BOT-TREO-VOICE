@@ -8,7 +8,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import discord
 from discord import app_commands
 from discord.ext import commands
-import asyncio, os, logging, json, re, tempfile, shutil, subprocess
+import asyncio, os, logging, json, re, tempfile, shutil, subprocess, hashlib
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 from aiohttp import web
@@ -54,6 +54,10 @@ TIKBOT_AUTO_DOMAINS = os.environ.get("TIKBOT_AUTO_DOMAINS", "youtube tiktok inst
 # domains for which the bot should be silent (don't post detection messages)
 TIKBOT_SILENT_DOMAINS = os.environ.get("TIKBOT_SILENT_DOMAINS", "").split()
 TIKBOT_MAX_UPLOAD_MB = int(os.environ.get("TIKBOT_MAX_UPLOAD_MB", "50"))
+AUDIO_CACHE_DIR = Path(os.environ.get("AUDIO_CACHE_DIR", "/tmp/bot_audio_cache"))
+AUDIO_CACHE_MAX_MB = int(os.environ.get("AUDIO_CACHE_MAX_MB", "512"))
+NODE_MUSIC_WORKER_URL = os.environ.get("NODE_MUSIC_WORKER_URL", "").rstrip("/")
+NODE_MUSIC_WORKER_TOKEN = os.environ.get("NODE_MUSIC_WORKER_TOKEN", "")
 
 PROFILE_DB_FILE = Path("/tmp/profiles.json")
 VC_STATE_FILE   = Path("/tmp/vc_state.json") # kênh nào đang có panel mở + message id
@@ -354,6 +358,63 @@ if HTTP_PROXY:
 
 class YTDLSource:
     @staticmethod
+    async def _prefetch_with_node_worker(query: str, source_name: str) -> dict | None:
+        if not NODE_MUSIC_WORKER_URL:
+            return None
+
+        def request_worker():
+            payload = json.dumps({"query": query}).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            if NODE_MUSIC_WORKER_TOKEN:
+                headers["Authorization"] = f"Bearer {NODE_MUSIC_WORKER_TOKEN}"
+            request = Request(
+                f"{NODE_MUSIC_WORKER_URL}/prefetch",
+                data=payload,
+                headers=headers,
+                method="POST",
+            )
+            with urlopen(request, timeout=300) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            if not result.get("ok") or not result.get("source", {}).get("path"):
+                raise RuntimeError(result.get("error", "Node worker returned no audio file"))
+            source = result["source"]
+            return {
+                "webpage_url": source.get("webpage_url") or query,
+                "title": source.get("title") or query,
+                "url": source["path"],
+                "duration": source.get("duration"),
+                "local_file": True,
+                "source": source_name,
+            }
+
+        try:
+            result = await asyncio.to_thread(request_worker)
+            log.info("Node music worker prefetched %s", query)
+            return result
+        except Exception as exc:
+            log.warning("Node music worker unavailable for %s: %s; using Python fallback", query, exc)
+            return None
+
+    @staticmethod
+    def _prune_audio_cache(exclude: Path | None = None):
+        if AUDIO_CACHE_MAX_MB <= 0 or not AUDIO_CACHE_DIR.exists():
+            return
+        files = [path for path in AUDIO_CACHE_DIR.rglob('*') if path.is_file()]
+        total_bytes = sum(path.stat().st_size for path in files)
+        limit_bytes = AUDIO_CACHE_MAX_MB * 1024 * 1024
+        for path in sorted(files, key=lambda item: item.stat().st_mtime):
+            if total_bytes <= limit_bytes:
+                break
+            if exclude and path == exclude:
+                continue
+            try:
+                file_size = path.stat().st_size
+                path.unlink()
+                total_bytes -= file_size
+            except OSError:
+                continue
+
+    @staticmethod
     def _extract_url(raw_text: str) -> str:
         text = (raw_text or '').strip()
         if not text:
@@ -483,8 +544,17 @@ class YTDLSource:
         if yt_dlp is None:
             raise RuntimeError('yt-dlp is not installed')
 
-        tmp_dir = Path(tempfile.mkdtemp(prefix='yt_audio_'))
-        outtmpl = str(tmp_dir / "audio.%(ext)s")
+        raw_video_key = str(info.get('id') or hashlib.sha256(search.encode('utf-8')).hexdigest()[:24])
+        video_key = re.sub(r'[^A-Za-z0-9_.-]', '_', raw_video_key)
+        cache_dir = AUDIO_CACHE_DIR / video_key
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cached_files = [path for path in cache_dir.iterdir() if path.is_file() and path.stat().st_size > 0]
+        if cached_files:
+            cached_file = max(cached_files, key=lambda path: path.stat().st_mtime)
+            log.info('Using cached audio %s for %s', cached_file, search)
+            return str(cached_file)
+
+        outtmpl = str(cache_dir / "audio.%(ext)s")
         opts = dict(YTDL_OPTS)
         opts.update({
             'format': 'bestaudio/best',
@@ -500,11 +570,13 @@ class YTDLSource:
                 final_path = ydl.prepare_filename(downloaded)
             if final_path and os.path.exists(final_path):
                 log.info('Download fallback succeeded for %s -> %s', search, final_path)
+                cls._prune_audio_cache(Path(final_path))
                 return final_path
 
-            matches = sorted(tmp_dir.glob('*'))
+            matches = sorted(cache_dir.glob('*'))
             if matches:
                 log.info('Using downloaded audio file %s for %s', matches[0], search)
+                cls._prune_audio_cache(matches[0])
                 return str(matches[0])
         except Exception as exc:
             log.warning('Local download fallback failed for %s: %s', search, exc)
@@ -529,6 +601,10 @@ class YTDLSource:
 
         spotify_variants = cls._spotify_fallback_queries(search)
         candidate_queries = list(dict.fromkeys([search_to_extract] + spotify_variants))
+
+        node_source = await cls._prefetch_with_node_worker(search_to_extract, source_name)
+        if node_source:
+            return node_source
 
         # Retry logic for rate-limit errors (YouTube rate-limits for up to 1 hour!)
         max_retries = 3

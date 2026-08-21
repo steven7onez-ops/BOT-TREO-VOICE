@@ -3,3 +3,8 @@ builder = "dockerfile"
 
 [deploy]
 restartPolicyType = "always"
+
+[variables]
+NODE_MUSIC_WORKER_URL = "http://127.0.0.1:8787"
+MUSIC_WORKER_HOST = "127.0.0.1"
+MUSIC_WORKER_PORT = "8787"

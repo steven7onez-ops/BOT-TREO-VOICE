@@ -150,6 +150,30 @@ Spotify chỉ cung cấp thông tin bài hát nên bot sẽ tìm bản phát tư
 ### Yêu cầu hệ thống
 - `ffmpeg` phải có trong PATH nếu chạy local (Dockerfile đã cài trong container)
 - `yt-dlp` được liệt kê trong `requirements.txt` và sẽ được cài khi chạy `pip install -r requirements.txt`
+- Node.js 20+ là tuỳ chọn nếu muốn bật music worker kiểu Rawon; Dockerfile đã cài sẵn.
+
+### Node music worker (tuỳ chọn)
+
+Bot vẫn giữ Python làm bot Discord và voice manager. Music worker Node chạy nội bộ,
+dùng `yt-dlp` + FFmpeg để pre-cache audio vào cùng thư mục cache; nếu worker lỗi,
+bot tự quay về luồng Python hiện tại.
+
+Chạy local trong hai terminal:
+```bash
+node music_worker.mjs
+set NODE_MUSIC_WORKER_URL=http://127.0.0.1:8787
+python bot.py
+```
+
+Các biến liên quan:
+| `NODE_MUSIC_WORKER_URL` | URL nội bộ của worker, ví dụ `http://127.0.0.1:8787` |
+| `NODE_MUSIC_WORKER_TOKEN` | Token tuỳ chọn để bảo vệ endpoint nội bộ |
+| `MUSIC_WORKER_HOST` / `MUSIC_WORKER_PORT` | Host/port worker, mặc định `127.0.0.1:8787` |
+| `AUDIO_CACHE_DIR` | Thư mục cache dùng chung |
+| `AUDIO_CACHE_MAX_MB` | Dung lượng cache tối đa, mặc định `512` |
+
+Trong Docker/Railway, worker và bot được khởi động cùng container. Không expose port
+worker ra Internet; chỉ dùng endpoint loopback.
 
 ### Chạy local (Linux / macOS / Windows WSL)
 1. Cài Python 3.11+ hoặc 3.13 và `ffmpeg`.

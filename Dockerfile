@@ -1,6 +1,6 @@
 FROM python:3.13-slim
 
-RUN apt-get update && apt-get install -y git libopus0 ffmpeg && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y git libopus0 ffmpeg nodejs npm && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY requirements.txt .
@@ -9,6 +9,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Also keep pip updated
 RUN python -m pip install --upgrade pip
 
-COPY bot.py link_security.py ./
+COPY bot.py link_security.py music_worker.mjs package.json ./
 ENV PYTHONPATH=/app
-CMD ["python", "-u", "bot.py"]
+CMD ["sh", "-c", "node music_worker.mjs & exec python -u bot.py"]
