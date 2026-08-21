@@ -903,7 +903,7 @@ class MusicPlayer:
                 # try to reconnect to the owner's voice channel if possible
                 self.current = None
                 continue
-            before_opts = '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
+            before_opts = None if src.get('local_file') else '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
             options = '-vn -ac 2 -ar 48000 -b:a 192k'
             audio = discord.FFmpegPCMAudio(src['url'], before_options=before_opts, options=options)
             play_done = asyncio.Event()
@@ -1372,7 +1372,8 @@ async def play_cmd(ctx: commands.Context, *, query: str = None):
         return await ctx.reply(f"❌ Lỗi khi tìm/nạp track: {e}")
     player = get_player(ctx.guild)
     # play immediately: insert to left and stop current to switch
-    player.queue.appendleft({'title': src['title'], 'url': src['url'], 'webpage_url': src['webpage_url'], 'requester': ctx.author.display_name})
+    player.queue.appendleft({'title': src['title'], 'url': src['url'], 'webpage_url': src['webpage_url'],
+                             'local_file': src.get('local_file', False), 'requester': ctx.author.display_name})
     vc = ctx.guild.voice_client
     if vc and vc.is_playing():
         try:
@@ -1395,7 +1396,8 @@ async def queue_cmd(ctx: commands.Context, *, query: str = None):
         log.exception("yt-dlp extract failed: %s", e)
         return await ctx.reply(f"❌ Lỗi khi thêm vào queue: {e}")
     player = get_player(ctx.guild)
-    player.queue.append({'title': src['title'], 'url': src['url'], 'webpage_url': src['webpage_url'], 'requester': ctx.author.display_name})
+    player.queue.append({'title': src['title'], 'url': src['url'], 'webpage_url': src['webpage_url'],
+                         'local_file': src.get('local_file', False), 'requester': ctx.author.display_name})
     await ctx.send(f"➕ Đã thêm vào queue: **{src['title']}** · Nguồn: {src.get('source', 'YouTube')}")
 
 
