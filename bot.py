@@ -354,9 +354,32 @@ if HTTP_PROXY:
 
 class YTDLSource:
     @staticmethod
+    def _extract_url(raw_text: str) -> str:
+        text = (raw_text or '').strip()
+        if not text:
+            return ''
+        if text.startswith('<') and '>' in text:
+            text = text.strip('<>')
+        match = re.search(r'https?://[^\s)\]>]+', text)
+        if match:
+            return match.group(0).rstrip('.,!')
+
+        markdown_match = re.search(r'\]\((https?://[^\s)]+)\)', text)
+        if markdown_match:
+            return markdown_match.group(1).rstrip('.,!')
+
+        return text
+
+    @staticmethod
+    def _is_spotify_host(host: str) -> bool:
+        host = (host or '').lower().split(':', 1)[0]
+        return host in {"spotify.com", "www.spotify.com", "open.spotify.com", "spotify.link"} or host.endswith(".spotify.com")
+
+    @staticmethod
     def source_name(search: str) -> str:
-        host = urlparse(search).netloc.lower().split(':', 1)[0]
-        if host == "spotify.com" or host.endswith(".spotify.com") or host == "spotify.link":
+        target = YTDLSource._extract_url(search)
+        host = urlparse(target).netloc.lower().split(':', 1)[0]
+        if YTDLSource._is_spotify_host(host):
             return "Spotify"
         if "soundcloud.com" in host:
             return "SoundCloud"
@@ -364,20 +387,22 @@ class YTDLSource:
 
     @staticmethod
     def resolve_search(search: str) -> tuple[str, str]:
-        host = urlparse(search).netloc.lower().split(':', 1)[0]
-        if host == "spotify.com" or host.endswith(".spotify.com") or host == "spotify.link":
-            resolved = YTDLSource._spotify_oembed_query(search)
+        target = YTDLSource._extract_url(search)
+        host = urlparse(target).netloc.lower().split(':', 1)[0]
+        if YTDLSource._is_spotify_host(host):
+            resolved = YTDLSource._spotify_oembed_query(target)
             if not resolved:
                 raise RuntimeError('Không đọc được tên bài hát Spotify. Hãy dùng link bài hát cụ thể.')
             return resolved, "Spotify"
         if "soundcloud.com" in host:
-            return search, "SoundCloud"
-        return search, "YouTube"
+            return target, "SoundCloud"
+        return target, "YouTube"
 
     @staticmethod
     def _is_spotify_url(search: str) -> bool:
-        host = urlparse(search).netloc.lower().split(':', 1)[0]
-        return host == "spotify.com" or host.endswith(".spotify.com") or host == "spotify.link"
+        target = YTDLSource._extract_url(search)
+        host = urlparse(target).netloc.lower().split(':', 1)[0]
+        return YTDLSource._is_spotify_host(host)
 
     @staticmethod
     def _spotify_search_query(info: dict) -> str | None:
@@ -385,7 +410,53 @@ class YTDLSource:
         artist = info.get('artist') or info.get('author_name') or info.get('uploader') or info.get('creator')
         if not title:
             return None
-        return f"ytsearch1:{artist} - {title}" if artist else f"ytsearch1:{title}"
+
+        cleaned_title = re.sub(r'\s*[\[\(].*?[\]\)]', '', title).strip()
+        cleaned_title = re.sub(r'\s+', ' ', cleaned_title)
+        cleaned_artist = re.sub(r'\s*[\[\(].*?[\]\)]', '', str(artist or '')).strip()
+        cleaned_artist = re.sub(r'\s+', ' ', cleaned_artist)
+
+        if cleaned_artist and cleaned_artist.lower() not in cleaned_title.lower():
+            query = f"ytsearch1:{cleaned_artist} - {cleaned_title}"
+        else:
+            query = f"ytsearch1:{cleaned_title}"
+
+        return query if query and cleaned_title else None
+
+    @staticmethod
+    def _spotify_fallback_queries(search: str) -> list[str]:
+        target = YTDLSource._extract_url(search)
+        if not YTDLSource._is_spotify_url(target):
+            return []
+
+        variants: list[str] = []
+        try:
+            primary = YTDLSource._spotify_oembed_query(target)
+            if primary:
+                variants.append(primary)
+                stripped = primary.removeprefix('ytsearch1:').strip()
+                if ' - ' in stripped:
+                    left, right = stripped.split(' - ', 1)
+                    variants.extend([
+                        f'ytsearch1:{right} {left}',
+                        f'ytsearch1:{right}',
+                        f'ytsearch1:{left}',
+                    ])
+                else:
+                    variants.extend([
+                        f'ytsearch1:{stripped}',
+                        f'ytsearch1:{stripped.replace(" - ", " ")}',
+                    ])
+        except Exception:
+            pass
+
+        seen = set()
+        ordered: list[str] = []
+        for item in variants:
+            if item and item not in seen:
+                seen.add(item)
+                ordered.append(item)
+        return ordered
 
     @staticmethod
     def _spotify_oembed_query(url: str) -> str | None:
@@ -456,75 +527,183 @@ class YTDLSource:
         except RuntimeError:
             raise
 
+        spotify_variants = cls._spotify_fallback_queries(search)
+        candidate_queries = list(dict.fromkeys([search_to_extract] + spotify_variants))
+
         # Retry logic for rate-limit errors (YouTube rate-limits for up to 1 hour!)
         max_retries = 3
         retry_delays = [30, 120, 300]  # exponential backoff: 30s, 2min, 5min
         data = None  # Initialize data before loop
         last_error = None
-        
-        for attempt in range(max_retries):
-            def extract():
-                opts = dict(YTDL_OPTS)
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    return ydl.extract_info(search_to_extract, download=False)
 
-            try:
-                data = await asyncio.to_thread(extract)
-                log.info(f"✅ Successfully extracted: {search_to_extract}")
-                break  # success, exit retry loop
-                
-            except Exception as exc:
-                s = str(exc)
-                last_error = s
-                
-                # Check if rate-limited
-                is_rate_limited = 'rate-limited' in s.lower() or 'try again later' in s.lower() or 'HTTP Error 429' in s
-                
-                # If rate-limited and not last attempt, retry with exponential backoff
-                if is_rate_limited and attempt < max_retries - 1:
-                    delay = retry_delays[attempt]
-                    delay_min = delay // 60
-                    delay_sec = delay % 60
-                    log.warning(f"⏳ Rate-limited by YouTube! Retry {attempt+1}/{max_retries-1} after {delay_min}m {delay_sec}s... (💡 Setup YouTube cookies to bypass!)")
-                    await asyncio.sleep(delay)
-                    data = None  # Reset for next attempt
-                    continue  # Jump to next retry
-                
-                # If not rate-limited, try format fallback
-                if 'Requested format is not available' in s and not is_rate_limited:
-                    try:
-                        log.info("📝 Format not available, trying fallback...")
-                        alt_opts = dict(YTDL_OPTS)
-                        alt_opts.pop('format', None)
-                        def extract_alt():
-                            with yt_dlp.YoutubeDL(alt_opts) as ydl:
-                                return ydl.extract_info(search_to_extract, download=False)
-                        data = await asyncio.to_thread(extract_alt)
-                        log.info(f"✅ Fallback successful: {search_to_extract}")
-                        break
-                    except Exception as e:
-                        log.warning(f"Format fallback failed: {e}")
+        for current_query in candidate_queries:
+            for attempt in range(max_retries):
+                def extract():
+                    opts = dict(YTDL_OPTS)
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        return ydl.extract_info(current_query, download=False)
+
+                try:
+                    data = await asyncio.to_thread(extract)
+                    log.info(f"✅ Successfully extracted: {current_query}")
+                    search_to_extract = current_query
+                    break
+
+                except Exception as exc:
+                    s = str(exc)
+                    last_error = s
+
+                    is_rate_limited = 'rate-limited' in s.lower() or 'try again later' in s.lower() or 'HTTP Error 429' in s
+
+                    if is_rate_limited and attempt < max_retries - 1:
+                        delay = retry_delays[attempt]
+                        delay_min = delay // 60
+                        delay_sec = delay % 60
+                        log.warning(f"⏳ Rate-limited by YouTube! Retry {attempt+1}/{max_retries-1} after {delay_min}m {delay_sec}s... (💡 Setup YouTube cookies to bypass!)")
+                        await asyncio.sleep(delay)
                         data = None
+                        continue
+
+                    if 'Requested format is not available' in s and not is_rate_limited:
+                        try:
+                            log.info("📝 Format not available, trying fallback...")
+                            alt_opts = dict(YTDL_OPTS)
+                            alt_opts.pop('format', None)
+                            def extract_alt():
+                                with yt_dlp.YoutubeDL(alt_opts) as ydl:
+                                    return ydl.extract_info(current_query, download=False)
+                            data = await asyncio.to_thread(extract_alt)
+                            log.info(f"✅ Fallback successful: {current_query}")
+                            search_to_extract = current_query
+                            break
+                        except Exception as e:
+                            log.warning(f"Format fallback failed: {e}")
+                            data = None
+                    else:
+                        data = None
+
+                    if data is None:
+                        if 'Sign in to confirm' in s or 'cookies' in s.lower():
+                            if current_query != candidate_queries[-1]:
+                                log.warning('YouTube blocked %s; switching to Spotify fallback query: %s', current_query, candidate_queries[candidate_queries.index(current_query)+1] if candidate_queries.index(current_query)+1 < len(candidate_queries) else current_query)
+                                break
+                            raise RuntimeError(
+                                '🔐 YouTube requires cookies to access this video.\n'
+                                'Fix: Set env var YTDL_COOKIES_BASE64 with YouTube cookies.\n'
+                                'Read: SETUP_YOUTUBE_COOKIES.md for instructions.'
+                            )
+                        if is_rate_limited:
+                            raise RuntimeError(
+                                '⏳ YouTube rate-limited the session (wait time: up to 1 hour).\n'
+                                'Options:\n'
+                                '  1. Wait a few minutes and try again\n'
+                                '  2. Setup YouTube cookies (RECOMMENDED): SETUP_YOUTUBE_COOKIES.md\n'
+                                f'Error details: {s}'
+                            )
+                        if current_query != candidate_queries[-1]:
+                            break
+                        raise RuntimeError(f'❌ yt-dlp error: {s}')
+
+                if data is not None:
+                    break
+
+            if data is not None:
+                break
+
+        if data is None:
+            raise RuntimeError(
+                '❌ Failed to extract video after all retries.\n'
+                'If rate-limited, setup YouTube cookies to bypass: SETUP_YOUTUBE_COOKIES.md'
+            )
+
+        log.debug('yt-dlp returned data keys: %s', list(data.keys()) if isinstance(data, dict) else None)
+        if 'entries' in data:
+            entries = [e for e in data['entries'] if e]
+            if not entries:
+                raise RuntimeError('No entries found')
+            info = entries[0]
+        else:
+            info = data
+
+        # Prefer a direct audio format URL from `formats` if available
+        stream_url = None
+        if info.get('formats'):
+            # iterate from best to worst (formats often ordered), prefer audio codecs
+            for fmt in reversed(info['formats']):
+                try:
+                    # prefer audio-only or with audio
+                    if fmt.get('acodec') and fmt.get('acodec') != 'none' and fmt.get('url'):
+                        stream_url = fmt.get('url')
+                        break
+                except Exception:
+                    continue
+            log.debug('Found %d formats, selected stream_url=%s', len(info.get('formats', [])), bool(stream_url))
+        # fallback to top-level url
+        if not stream_url:
+            stream_url = info.get('url')
+
+        # If we still don't have a stream_url, try CLI fallback (yt-dlp executable)
+        if not stream_url:
+            try:
+                ytdlp_cli = shutil.which('yt-dlp')
+                if ytdlp_cli:
+                    log.info('Attempting yt-dlp CLI fallback for %s', search_to_extract)
+                    cli_cmd = [ytdlp_cli, '-J', search_to_extract]
+                    if COOKIE_FILE:
+                        cli_cmd += ['--cookies', COOKIE_FILE]
+                    p = subprocess.run(cli_cmd, capture_output=True, text=True, timeout=30)
+                    if p.returncode == 0 and p.stdout:
+                        try:
+                            j = json.loads(p.stdout)
+                            # pick first entry if playlist
+                            jinfo = j['entries'][0] if 'entries' in j and j['entries'] else j
+                            # prefer formats
+                            if jinfo.get('formats'):
+                                for fmt in reversed(jinfo['formats']):
+                                    if fmt.get('acodec') and fmt.get('acodec') != 'none' and fmt.get('url'):
+                                        stream_url = fmt.get('url')
+                                        break
+                            if not stream_url:
+                                stream_url = jinfo.get('url')
+                            info = jinfo
+                        except Exception:
+                            stream_url = None
+                    else:
+                        # try get-url with bestaudio
+                        cli_cmd2 = [ytdlp_cli, '-f', 'bestaudio', '-g', search_to_extract]
+                        if COOKIE_FILE:
+                            cli_cmd2 += ['--cookies', COOKIE_FILE]
+                        p2 = subprocess.run(cli_cmd2, capture_output=True, text=True, timeout=20)
+                        if p2.returncode == 0 and p2.stdout:
+                            first_line = p2.stdout.splitlines()[0].strip()
+                            stream_url = first_line
                 else:
-                    data = None
-                
-                # If we got here, extraction failed (either after all retries or non-retryable error)
-                if data is None:
-                    if 'Sign in to confirm' in s or 'cookies' in s.lower():
-                        raise RuntimeError(
-                            '🔐 YouTube requires cookies to access this video.\n'
-                            'Fix: Set env var YTDL_COOKIES_BASE64 with YouTube cookies.\n'
-                            'Read: SETUP_YOUTUBE_COOKIES.md for instructions.'
-                        )
-                    if is_rate_limited:
-                        raise RuntimeError(
-                            '⏳ YouTube rate-limited the session (wait time: up to 1 hour).\n'
-                            'Options:\n'
-                            '  1. Wait a few minutes and try again\n'
-                            '  2. Setup YouTube cookies (RECOMMENDED): SETUP_YOUTUBE_COOKIES.md\n'
-                            f'Error details: {s}'
-                        )
-                    raise RuntimeError(f'❌ yt-dlp error: {s}')
+                    log.debug('yt-dlp CLI not found in PATH; cannot fallback')
+            except Exception as e:
+                log.exception('yt-dlp CLI fallback failed: %s', e)
+
+        if not stream_url:
+            raise RuntimeError('Could not find playable stream URL in yt-dlp info')
+
+        if cls.should_use_local_download(stream_url):
+            local_path = cls.download_audio_to_temp(search_to_extract, info)
+            return {
+                'webpage_url': info.get('webpage_url'),
+                'title': info.get('title'),
+                'url': local_path,
+                'duration': info.get('duration'),
+                'local_file': True,
+                'source': source_name,
+            }
+
+        return {
+            'webpage_url': info.get('webpage_url'),
+            'title': info.get('title'),
+            'url': stream_url,
+            'duration': info.get('duration'),
+            'local_file': False,
+            'source': source_name,
+        }
         
         # Final check after all retries
         if data is None:
