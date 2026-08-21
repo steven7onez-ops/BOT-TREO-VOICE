@@ -92,6 +92,18 @@ def save_anti_nuke_config(guild_id: int, config: dict):
     database[str(guild_id)] = config
     save_json(ANTI_NUKE_DB_FILE, database)
 
+
+def parse_owner_id(raw_value: str):
+    if raw_value is None:
+        return None
+    value = raw_value.strip()
+    if not value:
+        return None
+    match = re.fullmatch(r"(?:<@!?|@)?(\d+)>?", value)
+    if not match:
+        return None
+    return int(match.group(1))
+
 # ── Intents ───────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.guilds          = True
@@ -351,6 +363,18 @@ class YTDLSource:
         return "YouTube"
 
     @staticmethod
+    def resolve_search(search: str) -> tuple[str, str]:
+        host = urlparse(search).netloc.lower().split(':', 1)[0]
+        if host == "spotify.com" or host.endswith(".spotify.com") or host == "spotify.link":
+            resolved = YTDLSource._spotify_oembed_query(search)
+            if not resolved:
+                raise RuntimeError('Không đọc được tên bài hát Spotify. Hãy dùng link bài hát cụ thể.')
+            return resolved, "Spotify"
+        if "soundcloud.com" in host:
+            return search, "SoundCloud"
+        return search, "YouTube"
+
+    @staticmethod
     def _is_spotify_url(search: str) -> bool:
         host = urlparse(search).netloc.lower().split(':', 1)[0]
         return host == "spotify.com" or host.endswith(".spotify.com") or host == "spotify.link"
@@ -422,19 +446,15 @@ class YTDLSource:
         if yt_dlp is None:
             raise RuntimeError('yt-dlp is not installed')
         loop = asyncio.get_event_loop()
-        
-        # Spotify has no audio extractor in yt-dlp; resolve its public metadata first.
-        if cls._is_spotify_url(search):
-            try:
-                spotify_query = await asyncio.to_thread(cls._spotify_oembed_query, search)
-            except Exception as exc:
-                raise RuntimeError(f'Không đọc được metadata Spotify: {exc}') from exc
-            if not spotify_query:
-                raise RuntimeError('Không đọc được tên bài hát Spotify. Hãy dùng link bài hát cụ thể.')
-            source_name = "Spotify"
-        else:
-            source_name = cls.source_name(search)
-            search = spotify_query
+
+        # Each source is handled differently:
+        # - YouTube links use the original URL directly.
+        # - SoundCloud links use the original URL directly.
+        # - Spotify links resolve to a YouTube search query via metadata.
+        try:
+            search_to_extract, source_name = cls.resolve_search(search)
+        except RuntimeError:
+            raise
 
         # Retry logic for rate-limit errors (YouTube rate-limits for up to 1 hour!)
         max_retries = 3
@@ -446,11 +466,11 @@ class YTDLSource:
             def extract():
                 opts = dict(YTDL_OPTS)
                 with yt_dlp.YoutubeDL(opts) as ydl:
-                    return ydl.extract_info(search, download=False)
+                    return ydl.extract_info(search_to_extract, download=False)
 
             try:
                 data = await asyncio.to_thread(extract)
-                log.info(f"✅ Successfully extracted: {search}")
+                log.info(f"✅ Successfully extracted: {search_to_extract}")
                 break  # success, exit retry loop
                 
             except Exception as exc:
@@ -478,9 +498,9 @@ class YTDLSource:
                         alt_opts.pop('format', None)
                         def extract_alt():
                             with yt_dlp.YoutubeDL(alt_opts) as ydl:
-                                return ydl.extract_info(search, download=False)
+                                return ydl.extract_info(search_to_extract, download=False)
                         data = await asyncio.to_thread(extract_alt)
-                        log.info(f"✅ Fallback successful: {search}")
+                        log.info(f"✅ Fallback successful: {search_to_extract}")
                         break
                     except Exception as e:
                         log.warning(f"Format fallback failed: {e}")
@@ -544,8 +564,8 @@ class YTDLSource:
             try:
                 ytdlp_cli = shutil.which('yt-dlp')
                 if ytdlp_cli:
-                    log.info('Attempting yt-dlp CLI fallback for %s', search)
-                    cli_cmd = [ytdlp_cli, '-J', search]
+                    log.info('Attempting yt-dlp CLI fallback for %s', search_to_extract)
+                    cli_cmd = [ytdlp_cli, '-J', search_to_extract]
                     if COOKIE_FILE:
                         cli_cmd += ['--cookies', COOKIE_FILE]
                     p = subprocess.run(cli_cmd, capture_output=True, text=True, timeout=30)
@@ -567,7 +587,7 @@ class YTDLSource:
                             stream_url = None
                     else:
                         # try get-url with bestaudio
-                        cli_cmd2 = [ytdlp_cli, '-f', 'bestaudio', '-g', search]
+                        cli_cmd2 = [ytdlp_cli, '-f', 'bestaudio', '-g', search_to_extract]
                         if COOKIE_FILE:
                             cli_cmd2 += ['--cookies', COOKIE_FILE]
                         p2 = subprocess.run(cli_cmd2, capture_output=True, text=True, timeout=20)
@@ -583,7 +603,7 @@ class YTDLSource:
             raise RuntimeError('Could not find playable stream URL in yt-dlp info')
 
         if cls.should_use_local_download(stream_url):
-            local_path = cls.download_audio_to_temp(search, info)
+            local_path = cls.download_audio_to_temp(search_to_extract, info)
             return {
                 'webpage_url': info.get('webpage_url'),
                 'title': info.get('title'),
@@ -1036,16 +1056,21 @@ def build_anti_nuke_view(guild_id: int, owner_id: int) -> AntiNukeView:
 async def set_owner_cmd(ctx: commands.Context, owner_id: str = ""):
     if not ctx.guild:
         return await ctx.reply("❌ Lệnh này chỉ dùng được trong server.")
+
     current_owner_id = load_anti_nuke_config(ctx.guild.id)["owner_id"]
     if ctx.author.id != ctx.guild.owner_id and ctx.author.id != current_owner_id:
         return await ctx.reply("❌ Chỉ Server Owner hoặc owner đã cấu hình mới được đặt owner ID.")
-    match = re.fullmatch(r"<?@!?(\d+)>?", owner_id.strip())
-    if not match:
-        return await ctx.reply("❌ Dùng: `+set_owner <user_id>` (có thể nhập mention).")
-    if int(match.group(1)) != ctx.author.id:
-        return await ctx.reply("❌ Owner chỉ có thể nhập ID của chính mình.")
+
+    parsed_owner_id = parse_owner_id(owner_id)
+    if parsed_owner_id is None:
+        return await ctx.reply("❌ Dùng: `+set_owner <user_id>` (có thể nhập ID hoặc mention).")
+
+    if ctx.author.id != ctx.guild.owner_id:
+        if parsed_owner_id != ctx.author.id:
+            return await ctx.reply("❌ Owner chỉ có thể nhập ID của chính mình.")
+
     config = load_anti_nuke_config(ctx.guild.id)
-    config["owner_id"] = int(match.group(1))
+    config["owner_id"] = parsed_owner_id
     save_anti_nuke_config(ctx.guild.id, config)
     await ctx.reply(f"✅ Đã đặt owner anti-nuke cho server này: <@{config['owner_id']}>")
 
