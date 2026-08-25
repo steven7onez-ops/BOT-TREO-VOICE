@@ -123,7 +123,7 @@ class VoiceBot(commands.Bot):
         super().__init__(command_prefix="+", intents=intents, help_command=None)
         self.permanent_channel_id: int = TARGET_CHANNEL
         self.temp_channel_id: int      = 0
-        self.auto_rejoin: bool         = True
+        self.auto_rejoin: bool         = False
         self.follow_owner: bool        = True
         self.start_time                = datetime.now(timezone.utc)
         self.anti_nuke_actions: dict[tuple[int, int, str], collections.deque] = {}
@@ -145,8 +145,6 @@ class VoiceBot(commands.Bot):
         if TIKBOT_VERSION:
             status_text = f"{status_text} | v{TIKBOT_VERSION}"
         await self.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name=status_text))
-        if self.permanent_channel_id:
-            await self._join_by_id(self.permanent_channel_id, label="kênh vĩnh viễn")
 
     def get_owner_id(self, guild_id: int) -> int:
         configured_owner = load_anti_nuke_config(guild_id)["owner_id"]
@@ -249,16 +247,9 @@ class VoiceBot(commands.Bot):
 
     # ── Treo voice logic (giữ nguyên từ bản cũ) ──────────────────────────────
     async def on_voice_state_update(self, member, before, after):
-        # Bot bị disconnect
+        # A manual disconnect must stay disconnected. The bot only joins when
+        # the configured owner enters a voice channel.
         if member == self.user:
-            if before.channel and not after.channel and self.auto_rejoin:
-                log.warning("⚠️  Bot bị disconnect, rejoin sau 3 giây...")
-                await asyncio.sleep(3)
-                rejoined = False
-                if self.temp_channel_id:
-                    rejoined = await self._join_by_id(self.temp_channel_id, label="kênh tạm thời")
-                if not rejoined and self.permanent_channel_id:
-                    await self._join_by_id(self.permanent_channel_id, label="kênh vĩnh viễn")
             return
 
         # Follow chủ vào voice (tính năng treo voice cũ)
@@ -884,11 +875,11 @@ class MusicPlayer:
         self.guild = guild
         self.bot = bot
         self.queue = collections.deque()
-        self.next_event = asyncio.Event()
         self.play_task = self.bot.loop.create_task(self.player_loop())
         self.current = None
         self.loop_one = False
         self.loop_all = False
+        self.stop_requested = False
 
     async def player_loop(self):
         while True:
@@ -903,6 +894,7 @@ class MusicPlayer:
                 # try to reconnect to the owner's voice channel if possible
                 self.current = None
                 continue
+            await update_music_presence()
             before_opts = None if src.get('local_file') else '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
             options = '-vn -ac 2 -ar 48000 -b:a 192k'
             audio = discord.FFmpegPCMAudio(src['url'], before_options=before_opts, options=options)
@@ -916,18 +908,44 @@ class MusicPlayer:
             except Exception as e:
                 log.exception('Failed to play: %s', e)
                 self.current = None
+                await update_music_presence()
                 continue
-            await play_done.wait()
+            timeout = max(60, int(src.get('duration') or 0) + 120)
+            try:
+                await asyncio.wait_for(play_done.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                log.error('Playback timed out in guild %s; stopping FFmpeg', self.guild.id)
+                try:
+                    vc.stop()
+                except Exception:
+                    pass
             # handle looping
-            if self.loop_one:
+            stopped = self.stop_requested
+            self.stop_requested = False
+            if not stopped and self.loop_one:
                 # replay same song immediately
                 self.queue.appendleft(src)
-            elif self.loop_all:
+            elif not stopped and self.loop_all:
                 self.queue.append(src)
             self.current = None
+            await update_music_presence()
 
 
 players: dict[int, MusicPlayer] = {}
+
+
+async def update_music_presence():
+    current = next((player.current for player in players.values() if player.current), None)
+    if current:
+        name = str(current.get('title') or 'đang phát nhạc')[:128]
+    else:
+        name = TIKBOT_STATUS_TEXT
+        if TIKBOT_VERSION:
+            name = f"{name} | v{TIKBOT_VERSION}"
+    try:
+        await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name=name))
+    except (discord.HTTPException, discord.ClientException) as exc:
+        log.warning('Không thể cập nhật presence: %s', exc)
 
 def get_player(guild: discord.Guild) -> MusicPlayer:
     pl = players.get(guild.id)
@@ -1376,10 +1394,13 @@ async def play_cmd(ctx: commands.Context, *, query: str = None):
                              'local_file': src.get('local_file', False), 'requester': ctx.author.display_name})
     vc = ctx.guild.voice_client
     if vc and vc.is_playing():
+        player.stop_requested = True
         try:
             vc.stop()
         except Exception:
             pass
+    else:
+        player.stop_requested = False
     await ctx.send(f"▶️ Đã phát ngay: **{src['title']}** · Nguồn: {src.get('source', 'YouTube')}")
 
 
@@ -1433,6 +1454,9 @@ async def pause_cmd(ctx: commands.Context):
 async def stop_cmd(ctx: commands.Context):
     vc = ctx.guild.voice_client
     player = get_player(ctx.guild)
+    player.stop_requested = True
+    player.loop_one = False
+    player.loop_all = False
     player.queue.clear()
     try:
         if vc:
@@ -1458,9 +1482,13 @@ async def repeat_cmd(ctx: commands.Context, *, mode: str = None):
     player = get_player(ctx.guild)
     if mode and mode.lower() in ('all','all'):
         player.loop_all = not player.loop_all
+        if player.loop_all:
+            player.loop_one = False
         await ctx.reply(f"🔁 Loop all: {'ON' if player.loop_all else 'OFF'}")
         return
     player.loop_one = not player.loop_one
+    if player.loop_one:
+        player.loop_all = False
     await ctx.reply(f"🔂 Loop single: {'ON' if player.loop_one else 'OFF'}")
 
 
@@ -1478,6 +1506,7 @@ async def playqueue_cmd(ctx: commands.Context, index: int = None):
     player.queue.appendleft(item)
     vc = ctx.guild.voice_client
     if vc and vc.is_playing():
+        player.stop_requested = True
         try:
             vc.stop()
         except Exception:
@@ -1654,21 +1683,6 @@ async def on_message(message: discord.Message):
                     
                     return  # Dừng xử lý tin nhắn này
                 
-                # Kiểm tra xem URL có phải từ các domain tự động phát hiện
-                sent = False
-                netloc = urlparse(u).netloc.lower()
-                for dom in TIKBOT_AUTO_DOMAINS:
-                    if not dom: continue
-                    if dom in netloc:
-                        if dom in TIKBOT_SILENT_DOMAINS:
-                            sent = True
-                            break
-                        try:
-                            await message.channel.send(f"🔗 Phát hiện link {dom}: {u}")
-                        except Exception:
-                            pass
-                        sent = True
-                        break
     except Exception as e:
         log.error(f"Lỗi kiểm tra URL: {e}")
 
@@ -2491,7 +2505,8 @@ async def leave(req):
 @routes.post("/auto_rejoin")
 async def auto_rejoin(req):
     if not check_key(req): raise web.HTTPUnauthorized()
-    body = await req.json(); bot.auto_rejoin = bool(body.get("enabled", True))
+    await req.json()
+    bot.auto_rejoin = False
     return web.json_response({"auto_rejoin": bot.auto_rejoin})
 
 @routes.post("/follow_owner")

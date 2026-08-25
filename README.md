@@ -3,7 +3,7 @@
 Bot Python (discord.py 2.4+) với 3 tính năng chính:
 
 1. **Voice Manager** — tự tạo kênh voice tạm thời kiểu VoiceMaster, panel điều khiển luôn nằm dưới cùng khi có chat mới
-2. **Treo Voice 24/7** — bot follow chủ vào voice, ở lại giữ kênh
+2. **Follow Voice** — bot vào voice khi chủ join và rời khi được ngắt kết nối
 3. **Profile System** — card giới thiệu thành viên + rating
 4. **Anti-nuke Monitoring** — theo dõi Audit Log và hạn chế hành vi phá server hàng loạt
 
@@ -84,7 +84,7 @@ Sau khi bot online, Server Owner nhập:
 ```
 Owner đã cấu hình có thể nhập `+anti_nuke` để mở menu và chọn bật/tắt giám sát, hành động (tước role hoặc ban) và kênh nhận cảnh báo. Chỉ owner đã cấu hình mới mở và sử dụng được menu.
 
-`OWNER_ID` vẫn được hỗ trợ như giá trị dự phòng cho tính năng follow voice cũ, nhưng không cần khai báo biến này để cấu hình anti-nuke.
+`OWNER_ID` vẫn được hỗ trợ như giá trị dự phòng cho tính năng follow voice. Bot không tự vào voice khi khởi động và không tự nối lại sau khi bị ngắt; dashboard chỉ cho phép vào kênh thủ công.
 
 Bot không thể xử lý Server Owner, user có role cao hơn bot, hoặc hành động xảy ra khi bot đã bị mất quyền/kick.
 
