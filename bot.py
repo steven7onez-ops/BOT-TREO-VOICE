@@ -2071,52 +2071,46 @@ async def tiktok_cmd(ctx: commands.Context, url: str = ""):
     except Exception:
         pass
 
+HELP_CATEGORIES = {
+    "general": ("🔧 Lệnh chung", "`+ping` — Kiểm tra bot\n`+help` — Danh sách lệnh"),
+    "voice": ("🎙️ Voice Manager", "`+voice_control` (`+vc`) — Mở bảng điều khiển cho kênh voice bạn đang ở\nAi cũng dùng được panel, không giới hạn chủ phòng hay admin."),
+    "profile": ("👤 Profile (Slash)", "`/profile @user` — Xem profile\n`/profile_set` — Tạo/sửa *(Admin)*\n`/profile_addphoto` — Thêm ảnh *(Admin)*\n`/profile_removephoto` — Xóa ảnh *(Admin)*\n`/profile_delete` — Xóa profile *(Admin)*"),
+    "caro": ("⭕❌ Cờ Caro 10x10", "`+caro @user` — Thách đấu 1 người\n`+caro` — Đấu với Bot (AI)\n`+danh <hàng> <cột>` (`+d`) — Đánh quân, vd: `+danh 5 7` hoặc `+danh E7`\n`+caro_end` — Huỷ ván đang chơi"),
+    "afk": ("💤 AFK", "`+afk [lý do]` — Bật AFK, vd: `+afk đi ngủ`\nTự tắt khi bạn gõ tin nhắn bất kỳ\nBot sẽ báo mọi người khi có ai tag bạn lúc AFK"),
+    "antinuke": ("🛡️ Anti-nuke", "`+set_owner <id>` — Server Owner đặt owner cho server\n`+anti_nuke` — Owner mở menu bật/tắt, chọn hành động và kênh log\nTự giám sát Audit Log và phản ứng khi có xóa kênh/role, ban/kick hoặc webhook hàng loạt."),
+    "music": ("🎵 Music (voice)", "`+play <link|search>` / `+p` — Phát ngay\nNguồn hỗ trợ: YouTube, Spotify (link bài hát), SoundCloud\nSpotify sẽ tìm bản phát tương ứng trên YouTube; SoundCloud phát trực tiếp qua yt-dlp.\n`+pause` — Tạm dừng\n`+stop` — Dừng và xoá bài đang phát\n`+queue <link|search>` — Thêm bài vào queue\n`+checkqueue` — Xem danh sách bài đang chờ\n`+shuffle` — Xáo trộn danh sách phát\n`+repeat` — Lặp lại 1 bài\n`+repeat all` — Lặp lại toàn bộ queue\n`+playqueue <số>` — Phát bài ở vị trí trong danh sách phát"),
+}
+
+
+def build_help_embed(category: str = "general") -> discord.Embed:
+    name, value = HELP_CATEGORIES[category]
+    embed = discord.Embed(title="📖 Danh sách lệnh", color=0x5865f2)
+    embed.add_field(name=name, value=value, inline=False)
+    embed.set_footer(text=f"Prefix: + | Bot: {bot.user}")
+    return embed
+
+
+class HelpCategorySelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label=name.replace("🎙️ ", "").replace("🔧 ", "").replace("👤 ", "").replace("⭕❌ ", "").replace("💤 ", "").replace("🛡️ ", "").replace("🎵 ", ""), emoji=name.split()[0], value=value)
+            for value, (name, _) in HELP_CATEGORIES.items()
+        ]
+        super().__init__(placeholder="Chọn nhóm lệnh", options=options, custom_id="help_categories")
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(embed=build_help_embed(self.values[0]), view=self.view)
+
+
+class HelpView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.add_item(HelpCategorySelect())
+
+
 @bot.command(name="help", aliases=["h"])
 async def help_cmd(ctx: commands.Context):
-    embed = discord.Embed(title="📖 Danh sách lệnh", color=0x5865f2)
-    embed.add_field(name="🔧 Lệnh chung", value="`+ping` — Kiểm tra bot\n`+help` — Danh sách lệnh", inline=False)
-    embed.add_field(name="🎙️ Voice Manager",
-        value="`+voice_control` (`+vc`) — Mở bảng điều khiển cho kênh voice bạn đang ở\n"
-              "Ai cũng dùng được panel, không giới hạn chủ phòng hay admin.",
-        inline=False)
-    embed.add_field(name="👤 Profile (Slash)",
-        value="`/profile @user` — Xem profile\n"
-              "`/profile_set` — Tạo/sửa *(Admin)*\n"
-              "`/profile_addphoto` — Thêm ảnh *(Admin)*\n"
-              "`/profile_removephoto` — Xóa ảnh *(Admin)*\n"
-              "`/profile_delete` — Xóa profile *(Admin)*",
-        inline=False)
-    embed.add_field(name="⭕❌ Cờ Caro 10x10",
-        value="`+caro @user` — Thách đấu 1 người\n"
-              "`+caro` — Đấu với Bot (AI)\n"
-              "`+danh <hàng> <cột>` (`+d`) — Đánh quân, vd: `+danh 5 7` hoặc `+danh E7`\n"
-              "`+caro_end` — Huỷ ván đang chơi",
-        inline=False)
-    embed.add_field(name="💤 AFK",
-        value="`+afk [lý do]` — Bật AFK, vd: `+afk đi ngủ`\n"
-              "Tự tắt khi bạn gõ tin nhắn bất kỳ\n"
-              "Bot sẽ báo mọi người khi có ai tag bạn lúc AFK",
-        inline=False)
-    embed.add_field(name="🛡️ Anti-nuke",
-        value="`+set_owner <id>` — Server Owner đặt owner cho server\n"
-              "`+anti_nuke` — Owner mở menu bật/tắt, chọn hành động và kênh log\n"
-              "Tự giám sát Audit Log và phản ứng khi có xóa kênh/role, ban/kick hoặc webhook hàng loạt.",
-        inline=False)
-    embed.add_field(name="🎵 Music (voice)",
-        value=("`+play <link|search>` / `+p` — Phát ngay\n"
-               "Nguồn hỗ trợ: YouTube, Spotify (link bài hát), SoundCloud\n"
-               "Spotify sẽ tìm bản phát tương ứng trên YouTube; SoundCloud phát trực tiếp qua yt-dlp.\n"
-               "`+pause` — Tạm dừng\n"
-               "`+stop` — Dừng và xoá bài đang phát\n"
-               "`+queue <link|search>` — Thêm bài vào queue\n"
-               "`+checkqueue` — Xem danh sách bài đang chờ\n"
-               "`+shuffle` — Xáo trộn danh sách phát\n"
-               "`+repeat` — Lặp lại 1 bài\n"
-               "`+repeat all` — Lặp lại toàn bộ queue\n"
-               "`+playqueue <số>` — Phát bài ở vị trí trong danh sách phảt\n"),
-        inline=False)
-    embed.set_footer(text=f"Prefix: + | Bot: {bot.user}")
-    await ctx.reply(embed=embed)
+    await ctx.reply(embed=build_help_embed(), view=HelpView())
 
 
 
