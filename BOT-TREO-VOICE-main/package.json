@@ -1,0 +1,11 @@
+{
+  "name": "bot-treo-voice-music-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "music-worker": "node music_worker.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
