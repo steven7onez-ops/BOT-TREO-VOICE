@@ -1,6 +1,6 @@
 FROM python:3.13-slim
 
-RUN apt-get update && apt-get install -y ca-certificates curl git libopus0 ffmpeg nodejs npm \
+RUN apt-get update && apt-get install -y ca-certificates curl git unzip libopus0 ffmpeg nodejs npm \
     && curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh \
     && deno --version \
     && rm -rf /var/lib/apt/lists/*
