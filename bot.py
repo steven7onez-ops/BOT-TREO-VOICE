@@ -10,6 +10,7 @@ from discord import app_commands
 from discord.ext import commands
 import asyncio, os, logging, json, re, tempfile, shutil, subprocess, hashlib
 from urllib.parse import quote, urlparse
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from aiohttp import web
 import collections, random
@@ -269,11 +270,19 @@ class VoiceBot(commands.Bot):
             log.error(f"❌ Không tìm thấy {label} ID={channel_id}"); return False
         return await self._join_channel(ch)
 
-    async def _join_channel(self, channel: discord.VoiceChannel) -> bool:
+    async def _join_channel(self, channel: discord.VoiceChannel, *, self_mute: bool = True) -> bool:
         vc = channel.guild.voice_client
         try:
-            if vc: await vc.move_to(channel); log.info(f"➡️  Chuyển sang: #{channel.name}")
-            else: await channel.connect(self_deaf=True, self_mute=True); log.info(f"🎙️  Join: #{channel.name}")
+            if vc:
+                if vc.channel != channel:
+                    await vc.move_to(channel)
+                await channel.guild.change_voice_state(
+                    channel=channel, self_deaf=True, self_mute=self_mute
+                )
+                log.info(f"➡️  Chuyển sang: #{channel.name}")
+            else:
+                await channel.connect(self_deaf=True, self_mute=self_mute)
+                log.info(f"🎙️  Join: #{channel.name}")
             return True
         except Exception as e: log.error(f"❌ Lỗi join: {e}"); return False
 
@@ -308,14 +317,14 @@ import base64
 YTDL_OPTS = {
     'quiet': True,
     'no_warnings': True,
-    'ignoreerrors': True,
     'default_search': 'ytsearch',
-    'http_headers': {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-    },
     'socket_timeout': 30,
-    'sleep_interval': 5,  # 5 giây delay giữa request để tránh rate-limit (YouTube rate-limits đòi hỏi delay lâu)
-    'max_sleep_interval': 30,  # tối đa 30s delay
+    'retries': 0,
+    'fragment_retries': 0,
+    'extractor_retries': 0,
+    'sleep_interval': 5,
+    'max_sleep_interval': 10,
+    'sleep_interval_requests': 1,
 }
 
 # Cookie support: either provide a file path in YTDL_COOKIE_FILE, raw cookies in
@@ -340,17 +349,12 @@ if not COOKIE_FILE and (cookie_raw or cookie_b64):
 if COOKIE_FILE:
     YTDL_OPTS['cookiefile'] = COOKIE_FILE
 
-# Proxy support: if HTTP_PROXY env var is set, use it
-HTTP_PROXY = os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy')
-if HTTP_PROXY:
-    YTDL_OPTS['proxy'] = HTTP_PROXY
-    log.info('Using HTTP proxy: %s', HTTP_PROXY)
-
-
 class YTDLSource:
     @staticmethod
     async def _prefetch_with_node_worker(query: str, source_name: str) -> dict | None:
-        if not NODE_MUSIC_WORKER_URL:
+        if not NODE_MUSIC_WORKER_URL or (
+            (cookie_raw or cookie_b64) and not os.environ.get('YTDL_COOKIE_FILE')
+        ):
             return None
 
         def request_worker():
@@ -382,6 +386,18 @@ class YTDLSource:
             result = await asyncio.to_thread(request_worker)
             log.info("Node music worker prefetched %s", query)
             return result
+        except HTTPError as exc:
+            try:
+                details = json.loads(exc.read().decode("utf-8")).get("error", str(exc))
+            except (UnicodeDecodeError, ValueError):
+                details = str(exc)
+            if YTDLSource.is_rate_limited_error(details):
+                raise RuntimeError(
+                    "⏳ YouTube is rate-limiting this session. The bot stopped retrying; "
+                    "wait before trying again. Cookies do not remove rate limits. "
+                    f"Details: {details}"
+                ) from exc
+            raise RuntimeError(f"Node music worker failed: {details}") from exc
         except Exception as exc:
             log.warning("Node music worker unavailable for %s: %s; using Python fallback", query, exc)
             return None
@@ -514,7 +530,6 @@ class YTDLSource:
     def _spotify_oembed_query(url: str) -> str | None:
         request = Request(
             f"https://open.spotify.com/oembed?url={quote(url, safe='')}",
-            headers={'User-Agent': YTDL_OPTS['http_headers']['User-Agent']},
         )
         with urlopen(request, timeout=15) as response:
             metadata = json.loads(response.read().decode('utf-8'))
@@ -529,6 +544,19 @@ class YTDLSource:
             return False
         host = urlparse(url).netloc.lower()
         return any(marker in host for marker in ("googlevideo.com", "googleusercontent.com", "ggpht.com"))
+
+    @staticmethod
+    def is_rate_limited_error(error: str) -> bool:
+        message = error.lower()
+        return any(marker in message for marker in (
+            "http error 429",
+            "http error 402",
+            "rate limited",
+            "rate-limit",
+            "rate limit",
+            "too many requests",
+            "this content isn't available, try again later",
+        ))
 
     @classmethod
     def download_audio_to_temp(cls, search: str, info: dict) -> str:
@@ -579,7 +607,6 @@ class YTDLSource:
     async def create_source(cls, search: str):
         if yt_dlp is None:
             raise RuntimeError('yt-dlp is not installed')
-        loop = asyncio.get_event_loop()
 
         # Each source is handled differently:
         # - YouTube links use the original URL directly.
@@ -597,91 +624,44 @@ class YTDLSource:
         if node_source:
             return node_source
 
-        # Retry logic for rate-limit errors (YouTube rate-limits for up to 1 hour!)
-        max_retries = 3
-        retry_delays = [30, 120, 300]  # exponential backoff: 30s, 2min, 5min
-        data = None  # Initialize data before loop
+        data = None
         last_error = None
 
         for current_query in candidate_queries:
-            for attempt in range(max_retries):
-                def extract():
-                    opts = dict(YTDL_OPTS)
-                    with yt_dlp.YoutubeDL(opts) as ydl:
-                        return ydl.extract_info(current_query, download=False)
+            def extract():
+                opts = dict(YTDL_OPTS)
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    return ydl.extract_info(current_query, download=False)
 
-                try:
-                    data = await asyncio.to_thread(extract)
+            try:
+                data = await asyncio.to_thread(extract)
+                if data is not None:
                     log.info(f"✅ Successfully extracted: {current_query}")
                     search_to_extract = current_query
-                    break
+            except Exception as exc:
+                error = str(exc)
+                last_error = error
+                if cls.is_rate_limited_error(error):
+                    raise RuntimeError(
+                        "⏳ YouTube is rate-limiting this session. The bot stopped retrying; "
+                        "wait before trying again. Cookies do not remove rate limits. "
+                        f"Details: {error}"
+                    ) from exc
 
-                except Exception as exc:
-                    s = str(exc)
-                    last_error = s
+                if 'sign in to confirm' in error.lower():
+                    raise RuntimeError(
+                        "YouTube requires account verification or access for this video. "
+                        "The bot will not retry or bypass that check."
+                    ) from exc
 
-                    is_rate_limited = 'rate-limited' in s.lower() or 'try again later' in s.lower() or 'HTTP Error 429' in s
-
-                    if is_rate_limited and attempt < max_retries - 1:
-                        delay = retry_delays[attempt]
-                        delay_min = delay // 60
-                        delay_sec = delay % 60
-                        log.warning(f"⏳ Rate-limited by YouTube! Retry {attempt+1}/{max_retries-1} after {delay_min}m {delay_sec}s... (💡 Setup YouTube cookies to bypass!)")
-                        await asyncio.sleep(delay)
-                        data = None
-                        continue
-
-                    if 'Requested format is not available' in s and not is_rate_limited:
-                        try:
-                            log.info("📝 Format not available, trying fallback...")
-                            alt_opts = dict(YTDL_OPTS)
-                            alt_opts.pop('format', None)
-                            def extract_alt():
-                                with yt_dlp.YoutubeDL(alt_opts) as ydl:
-                                    return ydl.extract_info(current_query, download=False)
-                            data = await asyncio.to_thread(extract_alt)
-                            log.info(f"✅ Fallback successful: {current_query}")
-                            search_to_extract = current_query
-                            break
-                        except Exception as e:
-                            log.warning(f"Format fallback failed: {e}")
-                            data = None
-                    else:
-                        data = None
-
-                    if data is None:
-                        if 'Sign in to confirm' in s or 'cookies' in s.lower():
-                            if current_query != candidate_queries[-1]:
-                                log.warning('YouTube blocked %s; switching to Spotify fallback query: %s', current_query, candidate_queries[candidate_queries.index(current_query)+1] if candidate_queries.index(current_query)+1 < len(candidate_queries) else current_query)
-                                break
-                            raise RuntimeError(
-                                '🔐 YouTube requires cookies to access this video.\n'
-                                'Fix: Set env var YTDL_COOKIES_BASE64 with YouTube cookies.\n'
-                                'Read: SETUP_YOUTUBE_COOKIES.md for instructions.'
-                            )
-                        if is_rate_limited:
-                            raise RuntimeError(
-                                '⏳ YouTube rate-limited the session (wait time: up to 1 hour).\n'
-                                'Options:\n'
-                                '  1. Wait a few minutes and try again\n'
-                                '  2. Setup YouTube cookies (RECOMMENDED): SETUP_YOUTUBE_COOKIES.md\n'
-                                f'Error details: {s}'
-                            )
-                        if current_query != candidate_queries[-1]:
-                            break
-                        raise RuntimeError(f'❌ yt-dlp error: {s}')
-
-                if data is not None:
-                    break
+                if data is None and current_query == candidate_queries[-1]:
+                    raise RuntimeError(f"❌ yt-dlp error: {last_error}") from exc
 
             if data is not None:
                 break
 
         if data is None:
-            raise RuntimeError(
-                '❌ Failed to extract video after all retries.\n'
-                'If rate-limited, setup YouTube cookies to bypass: SETUP_YOUTUBE_COOKIES.md'
-            )
+            raise RuntimeError(f"❌ yt-dlp could not extract a playable track: {last_error or 'no metadata returned'}")
 
         log.debug('yt-dlp returned data keys: %s', list(data.keys()) if isinstance(data, dict) else None)
         if 'entries' in data:
@@ -709,46 +689,6 @@ class YTDLSource:
         if not stream_url:
             stream_url = info.get('url')
 
-        # If we still don't have a stream_url, try CLI fallback (yt-dlp executable)
-        if not stream_url:
-            try:
-                ytdlp_cli = shutil.which('yt-dlp')
-                if ytdlp_cli:
-                    log.info('Attempting yt-dlp CLI fallback for %s', search_to_extract)
-                    cli_cmd = [ytdlp_cli, '-J', search_to_extract]
-                    if COOKIE_FILE:
-                        cli_cmd += ['--cookies', COOKIE_FILE]
-                    p = subprocess.run(cli_cmd, capture_output=True, text=True, timeout=30)
-                    if p.returncode == 0 and p.stdout:
-                        try:
-                            j = json.loads(p.stdout)
-                            # pick first entry if playlist
-                            jinfo = j['entries'][0] if 'entries' in j and j['entries'] else j
-                            # prefer formats
-                            if jinfo.get('formats'):
-                                for fmt in reversed(jinfo['formats']):
-                                    if fmt.get('acodec') and fmt.get('acodec') != 'none' and fmt.get('url'):
-                                        stream_url = fmt.get('url')
-                                        break
-                            if not stream_url:
-                                stream_url = jinfo.get('url')
-                            info = jinfo
-                        except Exception:
-                            stream_url = None
-                    else:
-                        # try get-url with bestaudio
-                        cli_cmd2 = [ytdlp_cli, '-f', 'bestaudio', '-g', search_to_extract]
-                        if COOKIE_FILE:
-                            cli_cmd2 += ['--cookies', COOKIE_FILE]
-                        p2 = subprocess.run(cli_cmd2, capture_output=True, text=True, timeout=20)
-                        if p2.returncode == 0 and p2.stdout:
-                            first_line = p2.stdout.splitlines()[0].strip()
-                            stream_url = first_line
-                else:
-                    log.debug('yt-dlp CLI not found in PATH; cannot fallback')
-            except Exception as e:
-                log.exception('yt-dlp CLI fallback failed: %s', e)
-
         if not stream_url:
             raise RuntimeError('Could not find playable stream URL in yt-dlp info')
 
@@ -771,103 +711,6 @@ class YTDLSource:
             'local_file': False,
             'source': source_name,
         }
-        
-        # Final check after all retries
-        if data is None:
-            raise RuntimeError(
-                '❌ Failed to extract video after all retries.\n'
-                'If rate-limited, setup YouTube cookies to bypass: SETUP_YOUTUBE_COOKIES.md'
-            )
-        
-        log.debug('yt-dlp returned data keys: %s', list(data.keys()) if isinstance(data, dict) else None)
-        if 'entries' in data:
-            entries = [e for e in data['entries'] if e]
-            if not entries:
-                raise RuntimeError('No entries found')
-            info = entries[0]
-        else:
-            info = data
-
-        # Prefer a direct audio format URL from `formats` if available
-        stream_url = None
-        if info.get('formats'):
-            # iterate from best to worst (formats often ordered), prefer audio codecs
-            for fmt in reversed(info['formats']):
-                try:
-                    # prefer audio-only or with audio
-                    if fmt.get('acodec') and fmt.get('acodec') != 'none' and fmt.get('url'):
-                        stream_url = fmt.get('url')
-                        break
-                except Exception:
-                    continue
-            log.debug('Found %d formats, selected stream_url=%s', len(info.get('formats', [])), bool(stream_url))
-        # fallback to top-level url
-        if not stream_url:
-            stream_url = info.get('url')
-
-        # If we still don't have a stream_url, try CLI fallback (yt-dlp executable)
-        if not stream_url:
-            try:
-                ytdlp_cli = shutil.which('yt-dlp')
-                if ytdlp_cli:
-                    log.info('Attempting yt-dlp CLI fallback for %s', search_to_extract)
-                    cli_cmd = [ytdlp_cli, '-J', search_to_extract]
-                    if COOKIE_FILE:
-                        cli_cmd += ['--cookies', COOKIE_FILE]
-                    p = subprocess.run(cli_cmd, capture_output=True, text=True, timeout=30)
-                    if p.returncode == 0 and p.stdout:
-                        try:
-                            j = json.loads(p.stdout)
-                            # pick first entry if playlist
-                            jinfo = j['entries'][0] if 'entries' in j and j['entries'] else j
-                            # prefer formats
-                            if jinfo.get('formats'):
-                                for fmt in reversed(jinfo['formats']):
-                                    if fmt.get('acodec') and fmt.get('acodec') != 'none' and fmt.get('url'):
-                                        stream_url = fmt.get('url')
-                                        break
-                            if not stream_url:
-                                stream_url = jinfo.get('url')
-                            info = jinfo
-                        except Exception:
-                            stream_url = None
-                    else:
-                        # try get-url with bestaudio
-                        cli_cmd2 = [ytdlp_cli, '-f', 'bestaudio', '-g', search_to_extract]
-                        if COOKIE_FILE:
-                            cli_cmd2 += ['--cookies', COOKIE_FILE]
-                        p2 = subprocess.run(cli_cmd2, capture_output=True, text=True, timeout=20)
-                        if p2.returncode == 0 and p2.stdout:
-                            first_line = p2.stdout.splitlines()[0].strip()
-                            stream_url = first_line
-                else:
-                    log.debug('yt-dlp CLI not found in PATH; cannot fallback')
-            except Exception as e:
-                log.exception('yt-dlp CLI fallback failed: %s', e)
-
-        if not stream_url:
-            raise RuntimeError('Could not find playable stream URL in yt-dlp info')
-
-        if cls.should_use_local_download(stream_url):
-            local_path = cls.download_audio_to_temp(search_to_extract, info)
-            return {
-                'webpage_url': info.get('webpage_url'),
-                'title': info.get('title'),
-                'url': local_path,
-                'duration': info.get('duration'),
-                'local_file': True,
-                'source': source_name,
-            }
-
-        return {
-            'webpage_url': info.get('webpage_url'),
-            'title': info.get('title'),
-            'url': stream_url,
-            'duration': info.get('duration'),
-            'local_file': False,
-            'source': source_name,
-        }
-
 
 
 class MusicPlayer:
@@ -1382,7 +1225,8 @@ async def play_cmd(ctx: commands.Context, *, query: str = None):
     if not ctx.author.voice or not ctx.author.voice.channel:
         return await ctx.reply("❌ Bạn cần đang ở trong kênh voice để phát nhạc!")
     # ensure connected
-    await bot._join_channel(ctx.author.voice.channel)
+    if not await bot._join_channel(ctx.author.voice.channel, self_mute=False):
+        return await ctx.reply("❌ Bot không thể vào kênh voice. Hãy kiểm tra quyền Kết nối và Nói.")
     try:
         src = await YTDLSource.create_source(query)
     except Exception as e:
@@ -1393,7 +1237,7 @@ async def play_cmd(ctx: commands.Context, *, query: str = None):
     player.queue.appendleft({'title': src['title'], 'url': src['url'], 'webpage_url': src['webpage_url'],
                              'local_file': src.get('local_file', False), 'requester': ctx.author.display_name})
     vc = ctx.guild.voice_client
-    if vc and vc.is_playing():
+    if vc and (vc.is_playing() or vc.is_paused()):
         player.stop_requested = True
         try:
             vc.stop()
@@ -1410,7 +1254,8 @@ async def queue_cmd(ctx: commands.Context, *, query: str = None):
         return await ctx.reply("❌ Dùng: `+queue <link or search>`")
     if not ctx.author.voice or not ctx.author.voice.channel:
         return await ctx.reply("❌ Bạn cần đang ở trong kênh voice để thêm vào queue!")
-    await bot._join_channel(ctx.author.voice.channel)
+    if not await bot._join_channel(ctx.author.voice.channel, self_mute=False):
+        return await ctx.reply("❌ Bot không thể vào kênh voice. Hãy kiểm tra quyền Kết nối và Nói.")
     try:
         src = await YTDLSource.create_source(query)
     except Exception as e:
@@ -1448,6 +1293,29 @@ async def pause_cmd(ctx: commands.Context):
         await ctx.reply("⏸️ Đã tạm dừng")
     except Exception as e:
         await ctx.reply(f"❌ Lỗi khi pause: {e}")
+
+
+@bot.command(name='resume')
+async def resume_cmd(ctx: commands.Context):
+    vc = ctx.guild.voice_client
+    if not vc or not vc.is_paused():
+        return await ctx.reply("❌ Không có bài nào đang tạm dừng")
+    try:
+        vc.resume()
+        await ctx.reply("▶️ Đã phát tiếp")
+    except Exception as e:
+        await ctx.reply(f"❌ Lỗi khi resume: {e}")
+
+
+@bot.command(name='skip', aliases=['next', 's'])
+async def skip_cmd(ctx: commands.Context):
+    vc = ctx.guild.voice_client
+    player = players.get(ctx.guild.id)
+    if not vc or not (vc.is_playing() or vc.is_paused()) or not player or not player.current:
+        return await ctx.reply("❌ Không có bài nào đang phát")
+    player.stop_requested = True
+    vc.stop()
+    await ctx.reply("⏭️ Đã bỏ qua bài hiện tại")
 
 
 @bot.command(name='stop')
@@ -2078,14 +1946,15 @@ HELP_CATEGORIES = {
     "caro": ("⭕❌ Cờ Caro 10x10", "`+caro @user` — Thách đấu 1 người\n`+caro` — Đấu với Bot (AI)\n`+danh <hàng> <cột>` (`+d`) — Đánh quân, vd: `+danh 5 7` hoặc `+danh E7`\n`+caro_end` — Huỷ ván đang chơi"),
     "afk": ("💤 AFK", "`+afk [lý do]` — Bật AFK, vd: `+afk đi ngủ`\nTự tắt khi bạn gõ tin nhắn bất kỳ\nBot sẽ báo mọi người khi có ai tag bạn lúc AFK"),
     "antinuke": ("🛡️ Anti-nuke", "`+set_owner <id>` — Server Owner đặt owner cho server\n`+anti_nuke` — Owner mở menu bật/tắt, chọn hành động và kênh log\nTự giám sát Audit Log và phản ứng khi có xóa kênh/role, ban/kick hoặc webhook hàng loạt."),
-    "music": ("🎵 Music (voice)", "`+play <link|search>` / `+p` — Phát ngay\nNguồn hỗ trợ: YouTube, Spotify (link bài hát), SoundCloud\nSpotify sẽ tìm bản phát tương ứng trên YouTube; SoundCloud phát trực tiếp qua yt-dlp.\n`+pause` — Tạm dừng\n`+stop` — Dừng và xoá bài đang phát\n`+queue <link|search>` — Thêm bài vào queue\n`+checkqueue` — Xem danh sách bài đang chờ\n`+shuffle` — Xáo trộn danh sách phát\n`+repeat` — Lặp lại 1 bài\n`+repeat all` — Lặp lại toàn bộ queue\n`+playqueue <số>` — Phát bài ở vị trí trong danh sách phát"),
+    "music": ("🎵 Music (voice)", "`+play <link|search>` / `+p` — Phát ngay\nNguồn hỗ trợ: YouTube, Spotify (link bài hát), SoundCloud\nSpotify sẽ tìm bản phát tương ứng trên YouTube; SoundCloud phát trực tiếp qua yt-dlp.\n`+pause` — Tạm dừng\n`+resume` — Phát tiếp\n`+skip` (`+next`) — Bỏ qua bài hiện tại\n`+stop` — Dừng và xoá bài đang phát\n`+queue <link|search>` — Thêm bài vào queue\n`+checkqueue` — Xem danh sách bài đang chờ\n`+shuffle` — Xáo trộn danh sách phát\n`+repeat` — Lặp lại 1 bài\n`+repeat all` — Lặp lại toàn bộ queue\n`+playqueue <số>` — Phát bài ở vị trí trong danh sách phát"),
 }
 
 
-def build_help_embed(category: str = "general") -> discord.Embed:
-    name, value = HELP_CATEGORIES[category]
+def build_help_embed(category: str | None = None) -> discord.Embed:
     embed = discord.Embed(title="📖 Danh sách lệnh", color=0x5865f2)
-    embed.add_field(name=name, value=value, inline=False)
+    categories = [HELP_CATEGORIES[category]] if category else HELP_CATEGORIES.values()
+    for name, value in categories:
+        embed.add_field(name=name, value=value, inline=False)
     embed.set_footer(text=f"Prefix: + | Bot: {bot.user}")
     return embed
 

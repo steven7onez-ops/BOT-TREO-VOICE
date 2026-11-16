@@ -71,7 +71,8 @@ Xong! Giờ ai join vào kênh "➕ Tạo kênh thoại" sẽ tự có kênh ri�
 | `+play <link|từ khoá>` / `+p` | Phát nhạc từ YouTube, Spotify hoặc SoundCloud |
 | `+queue <link|từ khoá>` | Thêm nhạc vào queue |
 | `+checkqueue` | Xem queue hiện tại |
-| `+pause` / `+stop` | Tạm dừng / dừng nhạc |
+| `+skip` / `+next` | Bỏ qua bài đang phát |
+| `+pause` / `+resume` / `+stop` | Tạm dừng / phát tiếp / dừng nhạc |
 | `+shuffle` / `+repeat [all]` | Xáo trộn / lặp bài hoặc toàn bộ queue |
 
 ### 🛡️ Anti-nuke Monitoring
@@ -90,13 +91,18 @@ Bot không thể xử lý Server Owner, user có role cao hơn bot, hoặc hành
 
 ### 🎵 Nghe nhạc
 
-Bot hỗ trợ link bài hát Spotify (bao gồm link chia sẻ `spotify.link`) và link track/playlist SoundCloud:
+Bot hỗ trợ tìm bài theo từ khóa và link YouTube, link bài hát Spotify (bao gồm link chia sẻ `spotify.link`) và link track/playlist SoundCloud:
 ```text
++play never gonna give you up
++play https://www.youtube.com/watch?v=...
 +play https://open.spotify.com/track/...
 +play https://soundcloud.com/artist/track
 +queue <link hoặc từ khoá>
++pause
++resume
++skip
 ```
-Spotify chỉ cung cấp thông tin bài hát nên bot sẽ tìm bản phát tương ứng trên YouTube; SoundCloud được yt-dlp lấy stream trực tiếp. Người dùng cần ở trong kênh voice khi dùng `+play` hoặc `+queue`.
+Spotify chỉ cung cấp thông tin bài hát nên bot sẽ tìm bản phát tương ứng trên YouTube; SoundCloud được yt-dlp lấy stream trực tiếp. Người dùng cần ở trong kênh voice khi dùng `+play` hoặc `+queue`. Bot bỏ tự mute khi vào voice để có thể gửi âm thanh.
 
 ### Slash — Voice Manager
 | Lệnh | Ai dùng | Chức năng |
@@ -149,8 +155,8 @@ Spotify chỉ cung cấp thông tin bài hát nên bot sẽ tìm bản phát tư
 
 ### Yêu cầu hệ thống
 - `ffmpeg` phải có trong PATH nếu chạy local (Dockerfile đã cài trong container)
-- `yt-dlp` được liệt kê trong `requirements.txt` và sẽ được cài khi chạy `pip install -r requirements.txt`
-- Node.js 20+ là tuỳ chọn nếu muốn bật music worker kiểu Rawon; Dockerfile đã cài sẵn.
+- `yt-dlp[default]` và các script EJS dùng để giải thử thách JavaScript của YouTube được cài qua `requirements.txt`; cần một JavaScript runtime. yt-dlp khuyến nghị Deno (Dockerfile tự cài; xem [hướng dẫn EJS](https://github.com/yt-dlp/yt-dlp/wiki/EJS)).
+- Node.js 20+ cần cho music worker; Dockerfile đã cài sẵn và bật worker tự động.
 
 ### Node music worker (tuỳ chọn)
 
@@ -172,11 +178,18 @@ Các biến liên quan:
 | `AUDIO_CACHE_DIR` | Thư mục cache dùng chung |
 | `AUDIO_CACHE_MAX_MB` | Dung lượng cache tối đa, mặc định `512` |
 
-Trong Docker/Railway, worker và bot được khởi động cùng container. Không expose port
-worker ra Internet; chỉ dùng endpoint loopback.
+Trong Docker/Railway, worker và bot được khởi động cùng container, worker được bật
+sẵn qua `NODE_MUSIC_WORKER_URL`. Không expose port worker ra Internet; chỉ dùng
+endpoint loopback. Worker chạy các tác vụ yt-dlp tuần tự, chèn delay theo hướng
+dẫn yt-dlp; khi gặp rate limit, bot không tự retry.
+
+YouTube có thể thay đổi cơ chế phát và giới hạn truy cập; yt-dlp không thể tự tạo PO
+Token. Nếu YouTube yêu cầu token cho nội dung cụ thể, xem [hướng dẫn PO Token của
+yt-dlp](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide). Không cần cung cấp
+cookies cho nội dung công khai thông thường.
 
 ### Chạy local (Linux / macOS / Windows WSL)
-1. Cài Python 3.11+ hoặc 3.13 và `ffmpeg`.
+1. Cài Python 3.11+ hoặc 3.13, `ffmpeg` và Deno 2.3+ (runtime JavaScript được yt-dlp khuyến nghị).
 2. Cài dependencies:
 ```bash
 pip install -r requirements.txt
@@ -193,27 +206,12 @@ export TIKBOT_MAX_UPLOAD_MB=50
 python bot.py
 ```
 
-### YouTube cookies (khi yt-dlp báo "Sign in to confirm you're not a bot")
+### YouTube cookies
 
-Một số video YouTube yêu cầu cookie (ví dụ video age-restricted, region-restricted hoặc khi YouTube bật kiểm tra bot). Nếu bạn thấy lỗi như "Sign in to confirm you're not a bot" hoặc hướng dẫn dùng `--cookies-from-browser`, thực hiện một trong các cách sau:
-
-- Xuất cookies từ trình duyệt thành file `cookies.txt` bằng extension `cookies.txt` hoặc `EditThisCookie`.
-- Đặt cookie cho bot bằng một trong 2 cách:
-	- Upload file `cookies.txt` vào container và set biến môi trường `YTDL_COOKIE_FILE` trỏ tới đường dẫn file trong container (ví dụ `/app/cookies.txt`).
-	- Hoặc base64-encode nội dung `cookies.txt` rồi set vào biến môi trường `YTDL_COOKIES_BASE64` (an toàn hơn để lưu dưới dạng secret). Bot sẽ giải mã và ghi tạm file cookies khi cần.
-
-Ví dụ mã hóa file trên Linux/macOS:
-```bash
-base64 cookies.txt | tr -d '\n'  # copy kết quả đặt vào YTDL_COOKIES_BASE64
-```
-Ví dụ trên Windows PowerShell:
-```powershell
-[Convert]::ToBase64String([IO.File]::ReadAllBytes('cookies.txt'))
-```
-
-Sau đó trong Railway/GitHub Actions/ENV thêm biến `YTDL_COOKIES_BASE64` (secret) với giá trị base64 thu được, hoặc upload `cookies.txt` và set `YTDL_COOKIE_FILE`.
-
-Lưu ý: Cookies có thể hết hạn; nếu lỗi quay lại, xuất cookies mới và cập nhật secret.
+Video công khai thường không cần cookies. Chỉ dùng cookies bạn có quyền sử dụng
+cho nội dung thật sự yêu cầu đăng nhập; yt-dlp cảnh báo tài khoản có thể bị giới
+hạn hoặc khóa. Cookies không phải cách xử lý rate limit, CAPTCHA hay PO Token.
+Nếu cần cấu hình cho nội dung đăng nhập, xem [hướng dẫn cookies](./SETUP_YOUTUBE_COOKIES.md).
 
 ### Triển khai nhanh (Railway / Docker)
 - Repo đã có `Dockerfile` (cài `ffmpeg` + Python deps). Push lên GitHub và kết nối repo với Railway; Railway sẽ build Docker image tự động.

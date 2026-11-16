@@ -11,6 +11,13 @@ const port = Number(process.env.MUSIC_WORKER_PORT || 8787);
 const token = process.env.NODE_MUSIC_WORKER_TOKEN || "";
 const cacheDir = path.resolve(process.env.AUDIO_CACHE_DIR || "/tmp/bot_audio_cache");
 const locks = new Map();
+let ytdlpQueue = Promise.resolve();
+
+function runYtDlp(args, options) {
+  const task = ytdlpQueue.then(() => execFileAsync("yt-dlp", args, options));
+  ytdlpQueue = task.catch(() => {});
+  return task;
+}
 
 function authorized(request) {
   return !token || request.headers.authorization === `Bearer ${token}`;
@@ -41,8 +48,10 @@ async function findCachedFile(folder) {
 }
 
 async function prefetch(query) {
-  const { stdout: metadataJson } = await execFileAsync("yt-dlp", [
-    "--dump-single-json", "--no-playlist", "--skip-download", query,
+  const { stdout: metadataJson } = await runYtDlp([
+    "--dump-single-json", "--no-playlist", "--skip-download",
+    "--retries", "0", "--fragment-retries", "0", "--extractor-retries", "0",
+    "--sleep-requests", "1", query,
   ], { maxBuffer: 8 * 1024 * 1024, timeout: 60000 });
   const metadata = JSON.parse(metadataJson);
   const id = String(metadata.id || crypto.createHash("sha256").update(query).digest("hex").slice(0, 24));
@@ -53,9 +62,14 @@ async function prefetch(query) {
 
   if (!locks.has(id)) {
     locks.set(id, (async () => {
-      const args = ["--no-playlist", "--format", "bestaudio/best", "--output", path.join(folder, "audio.%(ext)s"), query];
+      const args = [
+        "--no-playlist", "--format", "bestaudio/best",
+        "--retries", "0", "--fragment-retries", "0", "--extractor-retries", "0",
+        "--sleep-requests", "1", "--sleep-interval", "5", "--max-sleep-interval", "10",
+        "--output", path.join(folder, "audio.%(ext)s"), query,
+      ];
       if (process.env.YTDL_COOKIE_FILE) args.unshift("--cookies", process.env.YTDL_COOKIE_FILE);
-      await execFileAsync("yt-dlp", args, { maxBuffer: 2 * 1024 * 1024, timeout: 300000 });
+      await runYtDlp(args, { maxBuffer: 2 * 1024 * 1024, timeout: 300000 });
     })().finally(() => locks.delete(id)));
   }
   await locks.get(id);
